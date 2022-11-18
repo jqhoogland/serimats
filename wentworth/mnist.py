@@ -5,6 +5,7 @@ from pprint import pp
 import numpy as np
 import torch as t
 from matplotlib import pyplot as plt
+from pyhessian import hessian  # Hessian computation
 from torch import nn
 from torch.utils.data import DataLoader
 from torchtyping import TensorType
@@ -54,8 +55,6 @@ class NeuralNetwork(nn.Module):
         self.flatten = nn.Flatten()
         self.linear_relu_stack = nn.Sequential(
             nn.Linear(28 * 28, 10),
-            nn.ReLU(),
-            nn.Linear(10, 10),
         )
 
     def forward(self, x):
@@ -125,7 +124,7 @@ t.save(model.state_dict(), os.path.join(os.path.dirname(__file__), "mnist.pth"))
 print("Saved PyTorch Model State to mnist.pth")
 
 # model = NeuralNetwork()
-# model.load_state_dict(torch.load("fashion-mnist.pth"))
+# model.load_state_dict(t.load("fashion-mnist.pth"))
 
 # %%
 
@@ -194,7 +193,6 @@ def hessian_mse(
 
     return 2 * G @ G.T
 
-
 # %%
 
 # Behavioral gradients (for all components of the output)
@@ -247,35 +245,32 @@ def full_hessian_mse(
 
 # %%
 
-x_train = train_dataloader.dataset.data.float()[
-    :1000
-]  # They seem to be randomly sorted
-G_train = full_behavioral_gradient(model, x_train)
+# They seem to be randomly sorted
+x_train = train_dataloader.dataset.data.float()[:1000]  # type: ignore
+# G_train = full_behavioral_gradient(model, x_train)
 
 # %%
 
-print(G_train.shape, t.linalg.matrix_rank(G_train))
-evals, evecs = t.linalg.eigh(G_train @ G_train.T)
+# print(G_train.shape, t.linalg.matrix_rank(G_train))
+# evals, evecs = t.linalg.eigh(G_train @ G_train.T)
 
-# %%
-print(G_train.shape)
+# print(G_train.shape)
 # plt.plot(evals)
 
-H_mse = 2 * G_train.T @ G_train
-
-print(H_mse.shape)
-
-# %%
-
-H_mse_evals = t.linalg.eigvalsh(H_mse)
-
-plt.plot(H_mse_evals)
-
+# H_mse = 2 * G_train.T @ G_train
+# print(H_mse.shape)
 
 # %%
 
+# H_mse_evals = t.linalg.eigvalsh(H_mse)
+# plt.plot(H_mse_evals)
+
+
+# %%
 
 # For 7960 parameters:
+
+# G has shape (1000, 7960 * 10)
 
 # When looking at a single component of the output, we get the following:
 # f[0]: 10,000 -> rank(G) = 1630
@@ -304,46 +299,58 @@ def hessian(model: nn.Module, x: t.Tensor, y: t.Tensor) -> tuple:  # Awful tuple
     return t.autograd.functional.hessian(cross_entropy_loss, tuple(model.parameters()))
 
 
-def flatten_hessian(H: tuple) -> TensorType["N_params * N_classes", "N_params * N_classes"]:
+def flatten_hessian(
+    H: tuple,
+) -> TensorType["N_params * N_classes", "N_params * N_classes"]:
     shapes = [p.shape for p in model.parameters()]
-    i_params = [0 for _ in range(len(shapes)+1)]
+    i_params = [0 for _ in range(len(shapes) + 1)]
     for i in range(len(shapes)):
-        i_params[i+1] = i_params[i] + np.product(shapes[i])
+        i_params[i + 1] = i_params[i] + np.product(shapes[i])
 
     n_params = sum(p.numel() for p in model.parameters())
     out = t.empty(n_params, n_params)
     for i in range(len(shapes)):
         for j in range(len(shapes)):
-            nvi = i_params[i+1]-i_params[i]
-            nvj = i_params[j+1]-i_params[j]
-            out[i_params[i]:i_params[i+1], i_params[j]:i_params[j+1]] = H[i][j].reshape(nvi,nvj)
+            nvi = i_params[i + 1] - i_params[i]
+            nvj = i_params[j + 1] - i_params[j]
+            out[i_params[i] : i_params[i + 1], i_params[j] : i_params[j + 1]] = H[i][
+                j
+            ].reshape(nvi, nvj)
 
     return out
 
 
-x_train = train_dataloader.dataset.data.float()[:1000]
-y_train = train_dataloader.dataset.targets[:1000]
+x_train = train_dataloader.dataset.data.float()[:100]
+y_train = train_dataloader.dataset.targets[:100]
 
 H = flatten_hessian(hessian(model, x_train, y_train))
 print(H.shape)
 
 # %%
 print(H.shape)
-H_evals = t.linalg.eigvalsh(H)
+H_evals, H_evecs = t.linalg.eig(H)
 plt.plot(H_evals)
 
 # %%
 
-H_norm = H / H.max()
+plt.hist(H_evals, bins=100)
 
 # %%
 
+print(H_evals.mean()) # tensor(6.2640e-06-1.4143e-20j)
+print(H_evals.std()) # tensor(0.0005) 
+
+print(np.sum(np.where(np.abs(H_evals) > 0.0005, 1, 0)))
+
+# %%
+
+
 def V_ball(n: int | float, R=1.0):
-    return 1. # We care about relative volumes
+    return 1.0  # We care about relative volumes
     # return t.pi ** (n / 2) / t.exp(t.special.gammaln(n / 2 + 1)) * R**n
 
 
-def V_ellipsoid(H: t.Tensor, T=.5):
+def V_ellipsoid(H: t.Tensor, T=0.5):
     # Ellipsoid volume
     # V_basin = V_n \prod_i \sqrt{2T/\lambda_i} = V_n (2T)^{n/2} / \sqrt{\det H},
     # where V_n is the volume of the n-dimensional unit ball, T is the loss threshold, and \lambda_i are the eigenvalues of the Hessian
@@ -352,17 +359,16 @@ def V_ellipsoid(H: t.Tensor, T=.5):
     return V_ball(n) * (2 * T) ** (n / 2) / t.sqrt(t.det(H))
 
 
-def V_fuzzy_ellipsoid(H: t.Tensor, T=.5, lmbda=1., k=1.0, sigma=1.0):
+def V_fuzzy_ellipsoid(H: t.Tensor, T=0.5, lmbda=1.0, k=1.0, sigma=1.0):
     # Fuzzy Ellipsoid (Gaussian) volume
     # V_basin = V_n (2T)^{n/2} / \sqrt{\det[H + (\lambda + c)I_n] },
     # where \lambda is the weight decay, c = k/\sigma^2 (\sigma is stdev of initialization Gaussian, k is a constant)
     n = H.shape[0]
-    c = k / sigma ** 2
+    c = k / sigma**2
     H_prime = H + (lmbda + c) * t.eye(n)
     return V_ball(n) * (2 * T) ** (n / 2) / t.sqrt(t.det(H_prime))
 
+print(V_fuzzy_ellipsoid(H))
 
-print(V_fuzzy_ellipsoid(H_norm))
 
 # %%
-
