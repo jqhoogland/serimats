@@ -1,0 +1,22 @@
+{
+    "os": "macOS-11.6.8-x86_64-i386-64bit",
+    "python": "3.10.8",
+    "heartbeatAt": "2022-12-14T16:54:18.891492",
+    "startedAt": "2022-12-14T16:54:13.783367",
+    "docker": null,
+    "cpu_count": 12,
+    "cuda": null,
+    "args": null,
+    "state": "running",
+    "program": "/Users/Jesse/Projects/notes/serimats/paths/paths.py",
+    "codePath": "paths/paths.py",
+    "git": {
+        "remote": "git@github.com:jqhoogland/serimats.git",
+        "commit": "198d9c98b721aae1794352ce7820815f69854005"
+    },
+    "email": "jessequinten@gmail.com",
+    "root": "/Users/Jesse/Projects/notes/serimats",
+    "host": "ucann.local",
+    "username": "Jesse",
+    "executable": "/Users/Jesse/.local/share/virtualenvs/notes-Szvzhu7a/bin/python"
+}
