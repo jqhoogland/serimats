@@ -1,6 +1,7 @@
 import warnings
+from abc import ABC, abstractmethod
 from pathlib import Path
-from typing import Callable, Optional, Union
+from typing import Callable, Optional, Tuple, TypedDict, Union
 
 import torch as t
 from torch import nn
@@ -9,11 +10,13 @@ from serimats.paths.utils import get_parameters
 
 
 class ExtendedModule(nn.Module):
-    config: dict
+    hyperparams: dict
 
-    def __init__(self, config: Optional[dict] = None):
-        self.config = config or {}
-
+    def __init__(
+        self,
+        hyperparams: Optional[dict] = None,
+    ):
+        self.hyperparams = hyperparams or {}
         super().__init__()
 
     @property
@@ -38,13 +41,19 @@ class ExtendedModule(nn.Module):
         self.parameters_vector *= value / self.parameters_norm
 
 
+class MNISTHyperparams(TypedDict):
+    n_hidden: Union[int, Tuple[int, ...]]
+
+
 class MNIST(ExtendedModule):
     """A simple MNIST classifier with a variable number of hidden layers."""
 
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
+    n_hidden: Union[int, Tuple[int, ...]]
 
-        n_hidden = self.config.get("n_hidden", 100)
+    def __init__(self, hyperparams: Optional[MNISTHyperparams] = None, **kwargs):
+        super().__init__(hyperparams=hyperparams, **kwargs)  # type: ignore
+
+        self.n_hidden = n_hidden = self.hyperparams.get("n_hidden", 100)
 
         if isinstance(n_hidden, int):
             n_hidden = (784, n_hidden, 10)

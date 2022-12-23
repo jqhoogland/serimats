@@ -13,6 +13,7 @@ from typing import (
     Sequence,
     Type,
     Union,
+    Tuple
 )
 
 import matplotlib as mpl
@@ -63,11 +64,13 @@ VARS = {
     "L_train": r"L_\mathrm{train}",
     "L_compare": r"L_\mathrm{compare}",
     "acc_train": r"\mathrm{acc}_\mathrm{train}",
+    "acc_test": r"\mathrm{acc}_\mathrm{test}",
     "acc_compare": r"\mathrm{acc}_\mathrm{compare}",
     "d_w": r"d_\mathbf{w}",
     "del_L_train": r"\delta L_\mathrm{train}",
     "del_L_test": r"\delta L_\mathrm{test}",
     "del_acc_test": r"\delta \mathrm{acc}_\mathrm{test}",
+    "del_acc_train": r"\delta \mathrm{acc}_\mathrm{train}",
     "rel_d_w": r"\frac{d_\mathbf{w}}{|\mathbf{w}_\mathrm{ref}|}",
 }
 
@@ -90,7 +93,7 @@ def dict_to_latex(d: dict):
     return ", ".join([f"{k} = {v}" for k, v in d.items()])
 
 
-def calculate_n_params(widths: tuple[int, ...]) -> int:
+def calculate_n_params(widths: Tuple[int, ...]) -> int:
     return (
         sum((widths[i] + 1) * widths[i + 1] for i in range(len(widths) - 1))
         + widths[-1]
@@ -99,14 +102,14 @@ def calculate_n_params(widths: tuple[int, ...]) -> int:
 
 def divide_params(
     n_params: int, n_layers: int, h_initial: int, h_final: int
-) -> tuple[int, ...]:
+) -> Tuple[int, ...]:
     """
     Divide parameters into n_layers layers and returns the number of units
     in each layer. Assumes each layer has c times as many parameters as the
     next layer, where c is a constant.
     """
 
-    def _calculate_widths(c: float) -> tuple[int, ...]:
+    def _calculate_widths(c: float) -> Tuple[int, ...]:
         return (h_initial, *(int((c**i) * h_final) for i in range(n_layers, -1, -1)))
 
     def _calculate_n_params(c: float):
@@ -142,7 +145,7 @@ class Snapshotter:
 
     def get_hash(self, **kwargs) -> str:
         kwargs = {k: kwargs[k] for k in sorted(kwargs.keys())}
-        print(f"Hashing {kwargs} -> {hash(str(kwargs))}")
+        # print(f"Hashing {kwargs} -> {hash(str(kwargs))}")
         return f"{self.prefix}{hash(str(kwargs))}"
 
 
@@ -161,19 +164,19 @@ class Logger:
     def df(self) -> pd.DataFrame:
         return pd.DataFrame(self.logs)
 
-    def save(self):
+    def save(self, **kwargs):
         df = self.df()
-        df.to_csv(self.dir / (self.prefix + ".csv"), index=False)
+        df.to_csv(self.dir / (self.get_hash(**kwargs) + ".csv"), index=False)
 
         return df
 
-    def load(self):
-        df = pd.read_csv(self.dir / (self.prefix + ".csv"))
+    def load(self, **kwargs):
+        df = pd.read_csv(self.dir / (self.get_hash(**kwargs) + ".csv"))
         self.logs = df.to_dict(orient="records")
 
     def get_hash(self, **kwargs) -> str:
         kwargs = {k: kwargs[k] for k in sorted(kwargs.keys())}
-        print(f"Hashing {kwargs} -> {hash(str(kwargs))}")
+        # print(f"Hashing {kwargs} -> {hash(str(kwargs))}")
         return f"{self.prefix}{hash(str(kwargs))}"
 
     def init(self):
@@ -192,9 +195,10 @@ def avg_over_training(
         .mean()
     )
 
+
 class Plotter:
     __metrics__ = [
-         "L_train",
+        "L_train",
         "del_L_train",
         "L_test",
         "del_L_test",
@@ -209,11 +213,17 @@ class Plotter:
     ]
 
     def plot(self, df: pd.DataFrame, **kwargs):
-        series = df[df[list(kwargs.keys())] == list(kwargs.values())]
+        series = df
+
+        # Filter for the right series
+        for k, v in kwargs.items():
+            series = series[series[k] == v]
+            print(k, v, series.shape)
+
         details_rep = dict_to_latex(kwargs) or ""
 
         if details_rep:
-          details_rep = f"(${details_rep}$)"
+            details_rep = f"\n(${details_rep}$)"
 
         fig, axs = plt.subplots(5, 2, figsize=(10, 15))
         fig.tight_layout(pad=5.0)
@@ -229,7 +239,7 @@ class Plotter:
                 "del_L_train",
                 "del_L_test",
                 "del_acc_test",
-                "acc_compare"
+                "acc_compare",
             )
 
             self.plot_over_training(
@@ -238,13 +248,13 @@ class Plotter:
                 f"${metric_latex}$ over training" + details_rep,
                 f"${metric_latex}$",
                 include_baseline=include_baseline,
-                ax=axs[i // 2][i % 2]
+                ax=axs[i // 2][i % 2],
             )
-            
+
             i += 1
 
             # TODO: compare wrt details
-        
+
         plt.show()
 
     def plot_over_training(
@@ -255,10 +265,10 @@ class Plotter:
         ylabel: str,
         include_baseline=True,
         n_models: int = 10,
-        ax: Optional[plt.Axes] = None
+        ax: Optional[plt.Axes] = None,
     ):
         start_idx = 0 if include_baseline else 1
-        
+
         if ax is None:
             fig, ax = plt.subplots(1, 1)
 
@@ -274,13 +284,11 @@ class Plotter:
             )
 
         steps = df[df["model_idx"] == 0]["step"]
-        train_loss_avg = avg_over_training(df, key, include_baseline)
+        avg = avg_over_training(df, key, include_baseline)
 
-
-        ax.plot(steps, train_loss_avg, label="Average")
+        ax.plot(steps, avg, label="Average")
 
         ax.set_title(title)
         ax.set_ylabel(ylabel)
         ax.set_xlabel("t")
         # ax.legend()
-

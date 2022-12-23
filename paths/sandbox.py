@@ -1,11 +1,8 @@
-"""
-Train a few MNITS classifiers and compare their trajectories.
-"""
-
 # %%
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import (
     Any,
     Collection,
@@ -29,13 +26,21 @@ import torch as t
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-import wandb
 from torch.utils.data import DataLoader
 from torchvision import datasets, transforms
+from tqdm.notebook import tqdm
 
-from serimats.paths.learner import MultiLearner
 from serimats.paths.models import MNIST
-from serimats.paths.utils import dict_to_latex, divide_params, setup, var_to_latex
+from serimats.paths.trainer import EnsembleLearner, Experiment
+from serimats.paths.utils import (
+    Logger,
+    Plotter,
+    Snapshotter,
+    dict_to_latex,
+    divide_params,
+    setup,
+    var_to_latex,
+)
 from serimats.paths.weights import (
     AbsolutePerturbationInitializer,
     RelativePerturbationInitializer,
@@ -43,8 +48,6 @@ from serimats.paths.weights import (
 )
 
 device = setup()
-
-# %%
 
 train_loader = DataLoader(
     datasets.MNIST(
@@ -68,187 +71,113 @@ test_loader = DataLoader(
     ),
     shuffle=True,
 )
-# %%
-
-
-def avg_over_training(
-    logs: pd.DataFrame,
-    key: str,
-    include_baseline=True,
-):
-    return (
-        (logs[logs["model_idx"] != 0] if not include_baseline else logs)
-        .groupby("step")[key]
-        .mean()
-    )
-
-
-def plot_over_training(
-    logs: Union[MultiLearner, pd.DataFrame, pd.Series],
-    key: str,
-    title: str,
-    ylabel: str,
-    include_baseline=True,
-    n_models: int = 10,
-):
-    logs = logs.logs if isinstance(logs, MultiLearner) else logs
-
-    start_idx = 0 if include_baseline else 1
-
-    for i in range(start_idx, int(n_models)):
-        data = logs[logs["model_idx"] == i]
-
-        plt.plot(
-            data["step"],
-            data[key],
-            "--",
-            label=f"Model {i}",
-            alpha=0.25,
-        )
-
-    steps = logs[logs["model_idx"] == 0]["step"]
-    train_loss_avg = avg_over_training(logs, key, include_baseline)
-    plt.plot(steps, train_loss_avg, label="Average")
-
-    plt.title(title)
-    plt.ylabel(ylabel)
-    plt.legend()
-
-    plt.show()
-
-
-# %%
-
-
-def plot_avgs_over_training(
-    multilearners: list[MultiLearner],
-    epsilons: list[float],
-    key: str,
-    title: str,
-    ylabel: str,
-):
-    steps = multilearners[0].logs[multilearners[0].logs["model_idx"] == 0]["step"]
-
-    for multilearner, epsilon in zip(multilearners, epsilons):
-        train_loss_avg = avg_over_training(
-            multilearner.logs, key, include_baseline=False
-        )
-        plt.plot(steps, train_loss_avg, label=f"$\epsilon={epsilon}$")
-
-    plt.title(title)
-    plt.xlabel("Training step")
-    plt.ylabel(ylabel)
-    plt.legend()
-
-    plt.show()
-
-
-# %%
 
 
 def run(
-    train_loader, test_loader, weight_initializer=None, model_cls=MNIST, **kwargs
-) -> Iterator[Tuple[pd.DataFrame, dict]]:
-    df = pd.DataFrame()
-
+    train_loader,
+    test_loader,
+    snapshotter,
+    plotter,
+    logger,
+    logging_ivl=100,
+    model_cls=MNIST,
+    opt_cls=optim.SGD,
+    **kwargs,
+):
     # Recursive call for any parameters which are provided as sequences
     for k, v in kwargs.items():
         if isinstance(v, (tuple, list)):
-            print(f"Iterating over {k}={v}")
-            for subvalue in v:
-                for subdf, details in run(
-                    train_loader, test_loader, **{**kwargs, k: subvalue}
-                ):
-                    df = pd.concat([df, subdf])
+            for subvalue in tqdm(v, desc=f"Iterating over {k}={v}"):
+                run(
+                    train_loader,
+                    test_loader,
+                    snapshotter,
+                    plotter,
+                    logger,
+                    logging_ivl=logging_ivl,
+                    model_cls=model_cls,
+                    opt_cls=opt_cls,
+                    **{**kwargs, k: subvalue},
+                )
 
-                    if k == "config":
-                        details.update(subvalue)
-                    else:
-                        details[k] = subvalue
-
-                    yield subdf, details
-
-    # Include seed in kwargs so we can iterate over multiple seeds
-    assert "seed" in kwargs, "Must provide `seed` as keyword argument"
-    t.manual_seed(kwargs.pop("seed"))
-
-    # Include epsilon in kwargs so we can iterate over multiple epsilon
-    epsilon = kwargs.pop("epsilon", 0.01)
-
-    if weight_initializer is None:
-        weight_initializer = RelativePerturbationInitializer(epsilon)
-
-    multilearner = MultiLearner(
+    ensemble = EnsembleLearner(
         model_cls,
+        opt_cls,
         train_loader,
         test_loader,
-        weight_initializer=weight_initializer,
         **kwargs,
     )
 
-    # Set weights
-    multilearner.train()
+    experiment = Experiment(
+        ensemble=ensemble,
+        snapshotter=snapshotter,
+        plotter=plotter,
+        logger=logger,
+        logging_ivl=logging_ivl,
+    )
 
-    yield multilearner.logs, {}
+    experiment.train(epoch_start=2)
 
 
-def run_and_plot(
-    train_loader, test_loader, weight_initializer=None, **kwargs
-) -> Optional[pd.DataFrame]:
-    result = None
+# DIR_PATH = Path("/content/drive/My Drive/AI/SERIMATS/Path Dependence")
+DIR_PATH = Path("..")
+SNAPSHOTS_PATH = DIR_PATH / "snapshots"
+LOGS_PATH = DIR_PATH / "logs"
 
-    for result, details in run(
-        train_loader, test_loader, weight_initializer=weight_initializer, **kwargs
-    ):
-        details_rep = dict_to_latex(details)
+N_EPOCHS = 25
+N_MODELS = 10
+LOGGING_IVL = 100
 
-        subresult = result
+# Variable
+SEED = 0
+EPSILON = 0.01
+MOMENTUM = 0.0
+LR = 0.01
+WEIGHT_DECAY = 0.0
 
-        for k, v in details.items():
-            subresult = subresult[subresult[k] == v]
+def get_opt_hyperparams(lr=LR, momentum=MOMENTUM, weight_decay=WEIGHT_DECAY):
+    if isinstance(lr, (tuple, list)):
+        return [get_opt_hyperparams(lr=lr_) for lr_ in lr]
+    if isinstance(momentum, (tuple, list)):
+        return [get_opt_hyperparams(momentum=m_) for m_ in momentum]
+    if isinstance(weight_decay, (tuple, list)):
+        return [get_opt_hyperparams(weight_decay=wd_) for wd_ in weight_decay]
 
-        for metric in MultiLearner.__metrics__:
-            metric_latex = var_to_latex(metric)
+    return {"lr": lr, "momentum": momentum, "weight_decay": weight_decay}
 
-            if metric_latex is None:
-                continue
+MODEL_HYPERPARAMS = {"n_hidden": 100}
 
-            include_baseline = metric not in (
-                "d_w",
-                "rel_d_w",
-                "del_L_train",
-                "del_L_test",
-                "del_acc_test",
-            )
-
-            plot_over_training(
-                subresult,
-                metric,
-                f"${metric_latex}$ over training (${details_rep}$)",
-                f"${metric_latex}$",
-                include_baseline=include_baseline,
-            )
-
-            # TODO: compare wrt details
-
-    return result
-
+snapshotter = Snapshotter(SNAPSHOTS_PATH)
+logger = Logger(LOGS_PATH)
+plotter = Plotter()  # TODO Save images as well
 
 # %%
-
-epsilon_results = run_and_plot(
+epsilon_results = run(
     train_loader,
     test_loader,
-    epsilon=[0.001, 0.01, 0.1, 1.0, 10.0],
-    seed=0,
-    logging_interval=1000,
-    epochs=10,
+    snapshotter=snapshotter,
+    plotter=plotter,
+    logger=logger,
+    logging_ivl=LOGGING_IVL,
+    seed=SEED,
+    weight_initializer=[
+        RelativePerturbationInitializer(epsilon=epsilon)
+        for epsilon in [0.001, 0.01, 0.1, 1.0, 10.0]
+    ],
+    n_epochs=N_EPOCHS,
+    n_models=N_MODELS,
+    opt_hyperparams=get_opt_hyperparams(),
+    model_hyperparams=MODEL_HYPERPARAMS,
 )
+
 # %%
 
-lr_experiments = run_and_plot(
+lr_experiments = run(
     train_loader,
     test_loader,
+    snapshotter=snapshotter,
+    plotter=plotter,
+    logger=logger,
     epsilon=0.01,
     lr=[0.001, 0.01, 0.1],
     seed=0,
@@ -257,9 +186,12 @@ lr_experiments = run_and_plot(
 
 # %%
 
-momentum_experiments = run_and_plot(
+momentum_experiments = run(
     train_loader,
     test_loader,
+    snapshotter=snapshotter,
+    plotter=plotter,
+    logger=logger,
     epsilon=0.01,
     momentum=[0.001, 0.01, 0.1],
     seed=0,
@@ -268,9 +200,12 @@ momentum_experiments = run_and_plot(
 
 # %%
 
-weight_decay_experiments = run_and_plot(
+weight_decay_experiments = run(
     train_loader,
     test_loader,
+    snapshotter=snapshotter,
+    plotter=plotter,
+    logger=logger,
     epsilon=0.01,
     lr=0.01,
     momentum=0.01,
@@ -281,9 +216,12 @@ weight_decay_experiments = run_and_plot(
 
 # %%
 
-seed_experiments = run_and_plot(
+seed_experiments = run(
     train_loader,
     test_loader,
+    snapshotter=snapshotter,
+    plotter=plotter,
+    logger=logger,
     epsilon=0.01,
     lr=0.01,
     momentum=0.01,
@@ -305,9 +243,12 @@ seed_experiments = run_and_plot(
 
 # %%
 
-width_experiments = run_and_plot(
+width_experiments = run(
     train_loader,
     test_loader,
+    snapshotter=snapshotter,
+    plotter=plotter,
+    logger=logger,
     epsilon=0.01,
     lr=0.01,
     momentum=0.01,
@@ -318,9 +259,12 @@ width_experiments = run_and_plot(
 )
 
 
-depth_experiments = run_and_plot(
+depth_experiments = run(
     train_loader,
     test_loader,
+    snapshotter=snapshotter,
+    plotter=plotter,
+    logger=logger,
     epsilon=0.01,
     lr=0.01,
     momentum=0.01,

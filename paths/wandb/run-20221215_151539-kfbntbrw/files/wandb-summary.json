@@ -1,1 +1,0 @@
-{"loss": 0.9958436489105225, "epoch": 0, "batch": 100, "step": 100, "model_idx": 9, "d_weights": 1.0108031034469604, "_timestamp": 1671135348.232901, "_runtime": 3.2092761993408203, "_step": 19, "_wandb": {"runtime": 28}}

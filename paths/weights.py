@@ -1,6 +1,15 @@
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Callable, Collection, Container, Iterable, Sequence, Type
+from typing import (
+    Callable,
+    Collection,
+    Container,
+    Iterable,
+    List,
+    Optional,
+    Sequence,
+    Type,
+)
 
 import matplotlib as mpl
 import matplotlib.pyplot as plt
@@ -15,12 +24,19 @@ import wandb
 from torch.utils.data import DataLoader
 from torchvision import datasets, transforms
 
+from serimats.paths.models import ExtendedModule
+
 
 class WeightInitializer(ABC):  # TODO: Nake Generic
     """A class that, when called, jointly initializes a sequence of models"""
 
     @abstractmethod
     def __call__(self, *models: nn.Module):
+        raise NotImplementedError
+
+    @property
+    @abstractmethod
+    def hyperparams(self) -> dict:
         raise NotImplementedError
 
 
@@ -31,10 +47,15 @@ class AbsolutePerturbationInitializer(WeightInitializer):
 
     epsilon: float = 0.01
     norm: Callable = t.norm
+    baseline: Optional[List[ExtendedModule]] = None
 
-    def __call__(self, *models: nn.Module):
-        # Assumes baseline is passed as the first argument
-        parameters = list(models[0].parameters())
+    def __call__(self, *models: ExtendedModule):
+        # The first time this is called, we need to store the baseline weights
+        if self.baseline is None:
+            self.baseline = models[0]
+            models = models[1:]
+
+        parameters = list(self.baseline.parameters())
         n_params = sum(p.numel() for p in parameters)
 
         for model in models[1:]:
@@ -47,6 +68,13 @@ class AbsolutePerturbationInitializer(WeightInitializer):
                 q.data = p.data.clone() + noise[i : i + p.numel()].view(p.shape)
                 i += p.numel()
 
+    @property
+    def hyperparams(self) -> dict:
+        return {
+            "weight_initialization": "absolute_perturbation",
+            "epsilon": self.epsilon,
+        }
+
 
 @dataclass
 class RelativePerturbationInitializer(WeightInitializer):
@@ -56,10 +84,21 @@ class RelativePerturbationInitializer(WeightInitializer):
 
     epsilon: float = 0.01
     norm: Callable = t.norm
+    baseline: Optional[ExtendedModule] = None
 
-    def __call__(self, *models: nn.Module):
-        # Assumes baseline is passed as the first argument
-        total_epsilon = self.norm(models[0].parameters_vector) * self.epsilon
+    def __call__(self, *models: ExtendedModule):
+        # The first time this is called, we need to store the baseline weights
+        if self.baseline is None:
+            self.baseline = models[0]
+
+        total_epsilon = (self.baseline.parameters_norm * self.epsilon).item()
         absolute_perturber = AbsolutePerturbationInitializer(total_epsilon)
 
         return absolute_perturber(*models)
+
+    @property
+    def hyperparams(self) -> dict:
+        return {
+            "weight_initialization": "relative_perturbation",
+            "epsilon": self.epsilon,
+        }
