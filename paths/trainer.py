@@ -110,37 +110,6 @@ class Learner:
         }
 
 
-@dataclass
-class Callback: 
-    after_create=None
-    before_fit=None
-    before_epoch=None
-    before_train=None
-    before_batch=None
-    after_pred=None
-    after_loss=None
-    before_backward=None
-    after_cancel_backward=None
-    after_backward=None
-    before_step=None
-    after_cancel_step=None
-    after_step=None
-    after_cancel_batch=None
-    after_batch=None
-    after_cancel_train=None
-    after_train=None
-    before_validate=None
-    after_cancel_validate=None
-    after_validate=None
-    after_cancel_epoch=None
-    after_epoch=None
-    after_cancel_fit=None
-    after_fit=None
-
-    def __call__(self, cb_name, *args, **kwargs):
-        f = getattr(self, cb_name)
-        if f: f(*args, **kwargs)    
-
 
 class EnsembleLearner:
     """
@@ -172,8 +141,6 @@ class EnsembleLearner:
         "rel_d_w",
     ]
 
-    callback: Callback
-
     def __init__(
         self,
         model_cls: Type[ExtendedModule],
@@ -186,7 +153,6 @@ class EnsembleLearner:
         seed: int = 0,
         model_hyperparams: Optional[Union[dict, List[dict]]] = None,
         opt_hyperparams: Optional[Union[dict, List[dict]]] = None,
-        callback: Optional[Callback] = None,
     ):
 
         self.model_cls = model_cls
@@ -232,8 +198,6 @@ class EnsembleLearner:
             for i, (model, optimizer) in enumerate(zip(models, optimizers))
         ]
 
-        self.callback = callback or Callback()
-
     def steps(
         self,
         epoch_start: int = 0,
@@ -241,22 +205,14 @@ class EnsembleLearner:
         losses = np.zeros(self.n_models)
 
         for epoch in range(epoch_start, self.n_epochs):
-            self.callback("before_epoch", epoch)
-
             for batch_idx, (data, target) in tqdm(
                 enumerate(self.train_loader), desc=f"Epoch: {epoch}"
-            ): 
-                self.callback("before_batch", epoch, batch_idx)
-
+            ):
                 for i, learner in enumerate(self.learners):
                     loss, acc = learner.train_one_batch(data, target)
                     losses[i] = loss.item()
 
-                self.callback("after_batch", epoch, batch_idx, losses)
-
                 yield epoch, batch_idx, losses
-            
-            self.callback("after_epoch", epoch)
 
     def inspect(self) -> List[Dict[str, Union[t.Tensor, int, float]]]:
         d_ws, rel_dw = self.d_ws_with_rel()
@@ -380,11 +336,6 @@ class Experiment:
         self.plotter = plotter
         self.logger = logger
         self.logging_ivl = logging_ivl
-
-        self.ensemble.callback = Callback(
-            "before_epoch", self.snapshotterr.load, 
-            "after_epoch", self.plotter.plot
-        )
 
     def train(self, epoch_start: int = 0, **kwargs):
         self.logger.init(**kwargs)
