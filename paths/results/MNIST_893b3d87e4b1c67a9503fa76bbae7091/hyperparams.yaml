@@ -1,0 +1,10 @@
+dampening: 0
+epsilon: 0.1
+lr: 0.01
+momentum: 0.0
+n_hidden: 100
+nesterov: false
+perturbation: relative
+seed_perturbation: 6
+seed_weights: 0
+weight_decay: 0.0

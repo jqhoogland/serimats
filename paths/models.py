@@ -1,3 +1,4 @@
+import math
 import warnings
 from abc import ABC, abstractmethod
 from pathlib import Path
@@ -18,6 +19,7 @@ class ExtendedModule(nn.Module):
     ):
         self.hyperparams = hyperparams or {}
         super().__init__()
+        # self.init_weights()
 
     @property
     def parameters_vector(self) -> t.Tensor:
@@ -27,8 +29,8 @@ class ExtendedModule(nn.Module):
     def parameters_vector(self, value: t.Tensor):
         i = 0
 
-        for p, v in zip(self.parameters(), value):
-            p.data = v[i : i + p.numel()].view(p.shape)
+        for p in self.parameters():
+            p.data = value[i : i + p.numel()].view(p.shape)
 
             i += p.numel()
 
@@ -39,6 +41,21 @@ class ExtendedModule(nn.Module):
     @parameters_norm.setter
     def parameters_norm(self, value: t.Tensor):
         self.parameters_vector *= value / self.parameters_norm
+
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            stdv = 1.0 / math.sqrt((module.weight.size(1)))
+            module.weight.data.uniform_(-stdv, stdv)
+
+            if module.bias is not None:
+                module.bias.data.uniform_(-stdv, stdv)
+
+    def init_weights(self):
+        self.apply(self._init_weights)
+
+    @property
+    def device(self) -> t.device:
+        return next(self.parameters()).device
 
 
 class MNISTHyperparams(TypedDict):

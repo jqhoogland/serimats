@@ -76,29 +76,30 @@ class Learner:
 
     def measure_one_batch(
         self, data: t.Tensor, target: t.Tensor
-    ) -> Tuple[t.Tensor, t.Tensor]:
+    ) -> Tuple[t.Tensor, t.Tensor, Tuple[t.Tensor, ...]]:
         output = self.model(data)
         loss = self.loss(output, target)
-        acc = (output.argmax(dim=1) == target).float().mean()
-        return loss, acc
+        pred = output.argmax(dim=1)
+        acc = (pred == target).float().mean()
+        return output, pred, (loss, acc)
 
     def train_one_batch(
         self, data: t.Tensor, target: t.Tensor
-    ) -> Tuple[t.Tensor, t.Tensor]:
+    ) -> Tuple[t.Tensor, t.Tensor, Tuple[t.Tensor, ...]]:
         self.optimizer.zero_grad()
-        loss, acc = self.measure_one_batch(data, target)
+        output, pred, (loss, acc) = self.measure_one_batch(data, target)
         loss.backward()
         self.optimizer.step()
 
-        return loss, acc
+        return output, pred, (loss, acc)
 
     def test_one_batch(
         self, data: t.Tensor, target: t.Tensor
-    ) -> Tuple[t.Tensor, t.Tensor]:
+    ) -> Tuple[t.Tensor, t.Tensor, Tuple[t.Tensor, ...]]:
         with t.no_grad():
-            metrics = self.measure_one_batch(data, target)
+            results = self.measure_one_batch(data, target)
 
-        return metrics
+        return results
 
     @property
     def hyperparams(self) -> dict:
@@ -109,6 +110,13 @@ class Learner:
             "loss_fn": self.loss.__name__,
         }
 
+    def __getattribute__(self, __name: str) -> Any:
+        if __name in self.hyperparams:
+            return self.hyperparams[__name]
+
+
+class Metrics:
+    pass
 
 
 class EnsembleLearner:
@@ -198,21 +206,60 @@ class EnsembleLearner:
             for i, (model, optimizer) in enumerate(zip(models, optimizers))
         ]
 
-    def steps(
+    def train_one_batch(self, data: t.Tensor, target: t.Tensor):
+        for model_idx, learner in enumerate(self.learners):
+            output, loss, acc = learner.train_one_batch(data, target)
+
+            yield model_idx, output, loss, acc
+
+    def train_batches(self, epoch: int = 0):
+        for batch_idx, (data, target) in tqdm(
+            enumerate(self.train_loader), desc=f"Epoch: {epoch}"
+        ):
+            yield batch_idx, data, target, self.train_one_batch(data, target)
+
+    def train_epochs(self, epoch_start: int = 0):
+        for epoch in range(epoch_start, self.n_epochs):
+            yield epoch, self.train_batches(epoch)
+
+    def train(
         self,
         epoch_start: int = 0,
     ):
-        losses = np.zeros(self.n_models)
+        """
+        I hate control flow that is based on exceptions and callbacks (like FastAI's).
+        Instead, I recommend implementing a custom training loop (using train_epochs, train_batches, train_one_batch)
+        """
+        for epoch, batches in self.train_epochs(epoch_start):
+            for batch_idx, data, target, steps in batches:
+                for i, output, pred, metrics in steps:
+                    pass
 
-        for epoch in range(epoch_start, self.n_epochs):
-            for batch_idx, (data, target) in tqdm(
-                enumerate(self.train_loader), desc=f"Epoch: {epoch}"
-            ):
-                for i, learner in enumerate(self.learners):
-                    loss, acc = learner.train_one_batch(data, target)
-                    losses[i] = loss.item()
+    def test_one_batch(self, data: t.Tensor, target: t.Tensor):
+        baseline_output = self.baseline.model(data)
+        baseline_pred = baseline_output.argmax(dim=1, keepdim=False)
 
-                yield epoch, batch_idx, losses
+        for model_idx, learner in enumerate(self.learners):
+            output, pred, L_test, acc_test = learner.test_one_batch(data, target)
+
+            L_compare = learner.loss(output, baseline_pred).item()
+            acc_compare = pred.eq(baseline_pred.view_as(pred)).mean().item()
+
+            yield model_idx, output, pred, L_test, acc_test, L_compare, acc_compare
+
+    def test_batches(self):
+        for batch_idx, (data, target) in enumerate(self.test_loader):
+            yield batch_idx, data, target, self.test_one_batch(data, target)
+
+    def test(
+        self,
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """Returns the loss and accuracy averaged over the entire test set."""
+        for batch_idx, (data, target) in enumerate(self.test_loader):
+            for model_idx, learner in enumerate(self.learners):
+                loss, acc = learner.test_one_batch(data, target)
+
+                yield model_idx, loss, acc
 
     def inspect(self) -> List[Dict[str, Union[t.Tensor, int, float]]]:
         d_ws, rel_dw = self.d_ws_with_rel()
@@ -341,32 +388,42 @@ class Experiment:
         self.logger.init(**kwargs)
         self.load(epoch_start, **kwargs)
 
-        for (epoch, batch_idx, losses) in self.ensemble.steps(
-            epoch_start=epoch_start, **kwargs
-        ):
-            if batch_idx % self.logging_ivl == 0:
-                measurements = self.ensemble.inspect()
+        losses = np.zeros((self.ensemble.n_models,))
 
-                for i, learner in enumerate(self.learners):
-                    self.logger.log(
-                        epoch=epoch,
-                        batch=batch_idx,
-                        step=epoch * len(self.ensemble.train_loader) + batch_idx,
-                        L_train=losses[i],
-                        del_L_train=losses[i] - losses[0],
-                        **measurements[i],
-                        **learner.hyperparams,
-                        **kwargs,
-                    )
+        for epoch, batches in self.ensemble.train_epochs(epoch_start):
+            learners = self.load(epoch, **kwargs)
 
-            if batch_idx == 0 and epoch > 0:
-                df = self.save(epoch=epoch - 1, **kwargs)
-                self.plot(df, epoch=epoch - 1, **self.hyperparams, **kwargs)
+            for batch_idx, data, target, _ in batches:
+                for learner in learners:
+                    loss, acc = learner.train_one_batch(data, target)
+                    losses[learner.idx] = loss
+
+                yield epoch, batch_idx, losses
+
+                if batch_idx % self.logging_ivl == 0:
+                    measurements = self.ensemble.inspect()
+
+                    for i, learner in enumerate(self.learners):
+                        self.logger.log(
+                            epoch=epoch,
+                            batch=batch_idx,
+                            step=epoch * len(self.ensemble.train_loader) + batch_idx,
+                            L_train=losses[i],
+                            del_L_train=losses[i] - losses[0],
+                            **measurements[i],
+                            **learner.hyperparams,
+                            **kwargs,
+                        )
+
+                if batch_idx == 0 and epoch > 0:
+                    df = self.save(epoch=epoch - 1, **kwargs)
+                    self.plot(df, epoch=epoch - 1, **self.hyperparams, **kwargs)
 
         df = self.save(epoch=self.ensemble.n_epochs - 1, **kwargs)
         self.plot(df, **self.hyperparams, **kwargs)
 
     def save(self, epoch: int, **kwargs):
+        """Save models to snapshot. Returns logs as a dataframe."""
         df = self.logger.save(**kwargs)
 
         for i, learner in enumerate(self.learners):
@@ -382,15 +439,17 @@ class Experiment:
         return df
 
     def load(self, epoch: int, **kwargs):
+        """Load models from snapshot. Any models that are not loaded are yielded."""
         for i, learner in enumerate(self.learners):
-            self.snapshotter.load(
+            if not self.snapshotter.load(
                 learner.model,
                 epoch=epoch,
                 **learner.hyperparams,
                 **kwargs,
-            )
-
-            # print(f"Loaded model {i} at epoch {epoch}.")
+            ):
+                yield learner
+            else:
+                print(f"Loaded model {i} at epoch {epoch}.")
 
     def plot(self, df: pd.DataFrame, **kwargs):
         self.plotter.plot(df, **kwargs)

@@ -11,9 +11,9 @@ from typing import (
     List,
     Optional,
     Sequence,
+    Tuple,
     Type,
     Union,
-    Tuple
 )
 
 import matplotlib as mpl
@@ -57,21 +57,29 @@ VARS = {
     "lr": r"\eta",
     "momentum": r"\beta",
     "n_models": "N",
+    "step": "t",
     "epoch": r"\mathrm{epoch}",
-    "epochs": "T",
+    "epochs": "T_i",
     "logging_interval": r"\Delta t",
     "L_test": r"L_\mathrm{test}",
     "L_train": r"L_\mathrm{train}",
     "L_compare": r"L_\mathrm{compare}",
+    "L_train_compare": r"L_\mathrm{cf. train}",
+    "L_test_compare": r"L_\mathrm{cf. test}",
     "acc_train": r"\mathrm{acc}_\mathrm{train}",
     "acc_test": r"\mathrm{acc}_\mathrm{test}",
     "acc_compare": r"\mathrm{acc}_\mathrm{compare}",
+    "acc_train_compare": r"\mathrm{acc}_\mathrm{cf. train}",
+    "acc_test_compare": r"\mathrm{acc}_\mathrm{cf. test}",
     "d_w": r"d_\mathbf{w}",
     "del_L_train": r"\delta L_\mathrm{train}",
     "del_L_test": r"\delta L_\mathrm{test}",
     "del_acc_test": r"\delta \mathrm{acc}_\mathrm{test}",
     "del_acc_train": r"\delta \mathrm{acc}_\mathrm{train}",
     "rel_d_w": r"\frac{d_\mathbf{w}}{|\mathbf{w}_\mathrm{ref}|}",
+    "seed_weights": r"\mathbf{w}_\mathrm{ref}",
+    "seed_perturbation": r"\delta \mathbf{w}^{(0)}",
+    "perturbation": "\mathrm{perturbation type}",
 }
 
 
@@ -138,10 +146,12 @@ class Snapshotter:
 
         if not path.exists():
             warnings.warn(f"Snapshot {path} does not exist ({kwargs}).")
-            return
+            return False
 
         state_dict = t.load(path)
         model.load_state_dict(state_dict)
+
+        return True
 
     def get_hash(self, **kwargs) -> str:
         kwargs = {k: kwargs[k] for k in sorted(kwargs.keys())}

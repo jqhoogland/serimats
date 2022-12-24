@@ -1,0 +1,785 @@
+# %%
+import hashlib
+import itertools
+from dataclasses import dataclass, field
+from os import PathLike
+from pathlib import Path
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    Iterable,
+    List,
+    Literal,
+    Optional,
+    Tuple,
+    Type,
+    TypedDict,
+    TypeVar,
+    Union,
+)
+
+import numpy as np
+import pandas as pd
+import torch as t
+import yaml
+from matplotlib import pyplot as plt
+from torch import nn, optim
+from torch.nn import functional as F
+from torch.utils.data import DataLoader
+from torchvision import datasets, transforms
+from tqdm import tqdm
+
+from serimats.paths.models import MNIST, ExtendedModule
+from serimats.paths.utils import dict_to_latex, setup, var_to_latex
+from serimats.paths.weights import (
+    AbsolutePerturbationInitializer,
+    RelativePerturbationInitializer,
+)
+
+setup()
+
+T = TypeVar("T")
+Hyperparameter = Union[T, Tuple[T, ...]]
+
+
+def stable_hash(x: Any) -> str:
+    return hashlib.sha256(str(x).encode("utf-8")).hexdigest()[:32]
+
+
+def to_tuple(x: Hyperparameter[T]) -> Tuple[T, ...]:
+    return x if isinstance(x, tuple) else (x,)
+
+
+def get_opt_hyperparams(opt: optim.Optimizer) -> dict:
+    """Assumes that the optimizer has only a single set of hyperparameters
+    (and not a separate set for each parameter group)"""
+    param_group = opt.param_groups[0]
+
+    hyperparams = {}
+
+    for k, v in param_group.items():
+        if k not in ["params", "foreach", "maximize", "capturable", "fused"]:
+            hyperparams[k] = v
+
+    return hyperparams
+
+
+@dataclass
+class Metrics:
+    baseline: ExtendedModule
+    train_dl: DataLoader  # Currently not in use
+    test_dl: DataLoader
+
+    class Report(TypedDict):
+        d_w: Optional[float]
+        rel_d_w: Optional[float]
+        L_train: Optional[float]
+        del_L_train: Optional[float]
+        acc_train: Optional[float]
+        del_acc_train: Optional[float]
+        L_train_compare: Optional[float]
+        acc_train_compare: Optional[float]
+        L_test: Optional[float]
+        del_L_test: Optional[float]
+        acc_test: Optional[float]
+        del_acc_test: Optional[float]
+        L_test_compare: Optional[float]
+        acc_test_compare: Optional[float]
+
+    def d_w(self, model: ExtendedModule) -> t.Tensor:
+        return t.norm(model.parameters_vector - self.baseline.parameters_vector)
+
+    def d_ws(self, models: List[ExtendedModule]) -> t.Tensor:
+        return t.tensor([self.d_w(model) for model in models])
+
+    def d_ws_with_rel(self, models: List[ExtendedModule]) -> Tuple[t.Tensor, t.Tensor]:
+        d_ws = self.d_ws(models)
+        rel_d_ws = d_ws / self.baseline.parameters_norm
+
+        return d_ws, rel_d_ws
+
+    def measure_model(
+        self, model: ExtendedModule, data: t.Tensor, target: t.Tensor
+    ) -> Tuple[float, float]:
+        output = model(data)
+
+        loss = self.loss(output, target, reduction="sum").item()
+        pred = output.argmax(dim=1, keepdim=True)
+        acc = pred.eq(target.view_as(pred)).sum().item()
+
+        return loss, acc
+
+    def test_batch(
+        self, models: List[ExtendedModule], data: t.Tensor, target: t.Tensor
+    ) -> Tuple[t.Tensor, ...]:
+        baseline_output = self.baseline(data)
+        baseline_pred = baseline_output.argmax(dim=1, keepdim=False)
+
+        L_test = t.zeros((len(models),))
+        acc_test = t.zeros((len(models),))
+
+        L_compare = t.zeros((len(models),))
+        acc_compare = t.zeros((len(models),))
+
+        for i, model in enumerate(models):
+            L_test[i], acc_test[i] = self.measure_model(model, data, target)
+            L_compare[i], acc_compare[i] = self.measure_model(
+                model, data, baseline_pred
+            )
+
+        return L_test, acc_test, L_compare, acc_compare
+
+    def data_set(
+        self, models: List[ExtendedModule], dl: DataLoader
+    ) -> Tuple[t.Tensor, ...]:
+        """Returns the loss and accuracy averaged over the entire test set."""
+        n_models = len(models)
+
+        with t.no_grad():
+            L_test = t.zeros((n_models,))
+            acc_test = t.zeros((n_models,))
+            L_compare = t.zeros((n_models,))
+            acc_compare = t.zeros(
+                (n_models),
+            )
+
+            if n_models == 0:
+                return (
+                    L_test,
+                    acc_test,
+                    L_compare,
+                    acc_compare,
+                    t.zeros((0,)),
+                    t.zeros((0,)),
+                )
+
+            for data, target in dl:
+                data, target = data.to(self.baseline.device), target.to(
+                    self.baseline.device
+                )
+
+                (
+                    L_test_batch,
+                    acc_test_batch,
+                    L_compare_batch,
+                    acc_compare_batch,
+                ) = self.test_batch(models, data, target)
+
+                L_test += L_test_batch
+                acc_test += acc_test_batch
+                L_compare += L_compare_batch
+                acc_compare += acc_compare_batch
+
+            n_samples = len(dl.dataset)  # type: ignore
+            L_test /= n_samples
+            acc_test /= n_samples
+            L_compare /= n_samples
+            acc_compare /= n_samples
+
+            del_L_test = L_test - L_test[0]
+            del_acc_test = acc_test - acc_test[0]
+
+            return L_test, acc_test, L_compare, acc_compare, del_L_test, del_acc_test
+
+    def test_set(self, models: List[ExtendedModule]) -> Tuple[t.Tensor, ...]:
+        """Returns the loss and accuracy averaged over the entire test set."""
+        return self.data_set(models, self.test_dl)
+
+    def train_set(self, models: List[ExtendedModule]) -> Tuple[t.Tensor, ...]:
+        """Returns the loss and accuracy averaged over the entire test set."""
+        return self.data_set(models, self.train_dl)
+
+    def measure(self, models: List[ExtendedModule]) -> Iterable[Report]:
+        n_models = len(models)
+        d_ws, rel_d_ws = self.d_ws_with_rel(models)
+
+        (
+            L_train,
+            acc_train,
+            L_train_compare,
+            acc_train_compare,
+            del_L_train,
+            del_acc_train,
+        ) = self.train_set(models)
+        (
+            L_test,
+            acc_test,
+            L_test_compare,
+            acc_test_compare,
+            del_L_test,
+            del_acc_test,
+        ) = self.test_set(models)
+
+        return [
+            self.Report(
+                d_w=d_ws[i].item(),
+                rel_d_w=rel_d_ws[i].item(),
+                L_train=L_train[i].item(),
+                del_L_train=del_L_train[i].item(),
+                acc_train=acc_train[i].item(),
+                del_acc_train=del_acc_train[i].item(),
+                L_train_compare=L_train_compare[i].item(),
+                acc_train_compare=acc_train_compare[i].item(),
+                L_test=L_test[i].item(),
+                del_L_test=del_L_test[i].item(),
+                acc_test=acc_test[i].item(),
+                del_acc_test=del_acc_test[i].item(),
+                L_test_compare=L_test_compare[i].item(),
+                acc_test_compare=acc_test_compare[i].item(),
+            )
+            for i in range(n_models)
+        ]
+
+    def loss(
+        self, output: t.Tensor, target: t.Tensor, reduction: str = "mean"
+    ) -> t.Tensor:
+        return F.nll_loss(output, target, reduction=reduction)
+
+    def keys(self) -> List[str]:
+        return [
+            "d_w",
+            "rel_d_w",
+            "L_train",
+            "del_L_train",
+            "acc_train",
+            "del_acc_train",
+            "L_train_compare",
+            "acc_train_compare",
+            "L_test",
+            "del_L_test",
+            "acc_test",
+            "del_acc_test",
+            "L_test_compare",
+            "acc_test_compare",
+        ]
+
+
+class Learner:
+    def __init__(
+        self,
+        model: ExtendedModule,
+        opt: optim.SGD,
+        weight_initializer: Callable[[ExtendedModule], None],
+        dir: PathLike,
+    ):
+        self.model = model
+        self.opt = opt
+        self.weight_initializer = weight_initializer
+        self.weight_initializer(self.model)
+
+        self.dir = Path(dir)
+        self.logs = {}
+        self.step = 0
+
+    @classmethod
+    def from_hyperparams(
+        cls,
+        model_cls: Type[MNIST],
+        opt_cls: Type[optim.SGD],
+        # Model
+        n_hidden: Union[int, List[int]] = 100,
+        # Weight initialization
+        seed_weights: int = 42,
+        seed_perturbation: int = 0,
+        epsilon: float = 0.0,
+        perturbation: Literal["relative", "absolute"] = "relative",
+        # Optimizer
+        lr: float = 0.01,
+        momentum: float = 0.0,
+        nesterov: bool = False,
+        weight_decay: float = 0.0,
+        **kwargs,
+    ):
+        model = model_cls(dict(n_hidden=n_hidden))
+        opt = opt_cls(
+            model.parameters(),
+            lr=lr,
+            momentum=momentum,
+            nesterov=nesterov,
+            weight_decay=weight_decay,
+        )  # type: ignore
+
+        weight_initializer_cls = (
+            RelativePerturbationInitializer
+            if perturbation == "relative"
+            else AbsolutePerturbationInitializer
+        )
+
+        weight_initializer = weight_initializer_cls(
+            seed_weights, seed_perturbation, epsilon
+        )
+
+        return cls(
+            model=model, opt=opt, weight_initializer=weight_initializer, **kwargs
+        )
+
+    def loss(
+        self, output: t.Tensor, target: t.Tensor, reduction: str = "mean"
+    ) -> t.Tensor:
+        return F.nll_loss(output, target, reduction=reduction)
+
+    def train_batch(
+        self, epoch: int, batch_idx: int, step: int, batch: Tuple[t.Tensor, t.Tensor]
+    ):
+        x, y = batch
+
+        self.opt.zero_grad()
+        output = self.model(x)
+        loss = self.loss(output, y)
+        loss.backward()
+        self.opt.step()
+        self.step = step
+
+        return loss.item()
+
+    def log(self, step: Optional[int] = None, **kwargs):
+        if step is None:
+            step = self.step
+
+        self.logs[step] = self.logs.get(step, {})
+        self.logs[step].update(kwargs)
+
+    def save(self, overwrite: bool = False):
+        self.path.mkdir(parents=True, exist_ok=True)
+        self.path_to_step.mkdir(parents=True, exist_ok=True)
+
+        if not overwrite and (self.path_to_step / "model.pt").exists():
+            # raise FileExistsError(self.path_to_step)
+            print(f"Step {self.step} already exists, skipping")
+            return False
+
+        self.df(full=False).to_csv(self.path / "logs.csv")
+        t.save(self.model.state_dict(), self.path_to_step / "model.pt")
+        t.save(self.opt.state_dict(), self.path_to_step / "opt.pt")
+
+        yaml.dump(self.hyperparams, open(self.path / "hyperparams.yaml", "w"))
+
+        print(
+            f"Saved model to {self.path_to_step} (step={self.step}, {self.extra_repr})"
+        )
+
+        return True
+
+    def load(self, step: Optional[int] = None):
+        try:
+            logs_df = pd.read_csv(self.path / "logs.csv")
+
+            if step is None:
+                self.step = logs_df["step"].max().item()
+            else:
+                self.step = step
+
+            logs_df = logs_df.set_index("step")
+            self.logs = logs_df.to_dict(orient="index")
+
+            print(logs_df)
+        except FileNotFoundError:
+            print(f"Could not load logs from {self.path / 'logs.csv'}")
+            print(yaml.dump(self.hyperparams))
+            self.logs = {}
+            return
+
+        try:
+            self.model.load_state_dict(t.load(self.path_to_step / "model.pt"))
+            self.opt.load_state_dict(t.load(self.path_to_step / "opt.pt"))
+
+            print(
+                f"Loaded model from {self.path_to_step} (step={self.step}, {self.extra_repr})"
+            )
+        except FileNotFoundError:
+            print(f"Could not load model or optimizer from {self.path_to_step}")
+
+    @property
+    def path_to_step(self):
+        return self.path / ("step-" + str(self.step))
+
+    @property
+    def path(self):
+        return self.dir / self.name
+
+    @property
+    def name(self):
+        return f"{self.model.__class__.__name__}_{self.hash}"
+
+    @property
+    def hash(self):
+        return stable_hash(self.extra_repr)
+
+    @property
+    def hyperparams(self):
+        hyperparams = {
+            **self.model.hyperparams,
+            **get_opt_hyperparams(self.opt),
+            **self.weight_initializer.hyperparams,
+        }
+
+        # Consistent ordering
+        return {k: hyperparams[k] for k in sorted(hyperparams.keys())}
+
+    @property
+    def extra_repr(self):
+        return ", ".join(f"{k}={v}" for k, v in self.hyperparams.items())
+
+    def df(self, full=True):
+        """DataFrame of logs (add on hyperparams as cols)"""
+        df = pd.DataFrame.from_dict(self.logs, orient="index")
+        df["step"] = df.index
+
+        if full:
+            df = df.assign(**self.hyperparams)
+
+        return df
+
+    @property
+    def device(self):
+        return self.model.device
+
+    def __call__(self, *args, **kwargs) -> t.Tensor:
+        return self.model(*args, **kwargs)
+
+
+class Ensemble:
+    def __init__(
+        self,
+        model_cls: Type[nn.Module],
+        opt_cls: Type[optim.Optimizer],
+        train_dl: DataLoader,
+        test_dl: DataLoader,
+        seed_dl: int,
+        dir: str,
+        logging_ivl: int = 100,
+        # Optimizer
+        momentum: Hyperparameter[float] = 0.0,
+        lr: Hyperparameter[float] = 0.01,
+        nesterov: Hyperparameter[bool] = False,
+        weight_decay: Hyperparameter[float] = 0.0,
+        # Model
+        n_hidden: Hyperparameter[Union[int, List[int]]] = 100,
+        # Weight initialization
+        seed_weights: Hyperparameter[int] = 0,
+        seed_perturbation: Hyperparameter[int] = 0,
+        epsilon: Hyperparameter[float] = 0.01,
+        perturbation: Hyperparameter[Literal["absolute", "relative"]] = "relative",
+    ):
+        self.model_cls = model_cls
+        self.opt_cls = opt_cls
+        self.seed_dl = seed_dl
+        self.dir = Path(dir)
+        self.logging_ivl = logging_ivl
+
+        self.train_dl = train_dl
+        self.test_dl = test_dl
+
+        # Turn hyperparameters into tuples
+        self.momentum = to_tuple(momentum)
+        self.lr = to_tuple(lr)
+        self.nesterov = to_tuple(nesterov)
+        self.weight_decay = to_tuple(weight_decay)
+        self.n_hidden = to_tuple(n_hidden)
+        self.seed_weights = to_tuple(seed_weights)
+        self.seed_perturbation = to_tuple(seed_perturbation)
+        self.epsilon = to_tuple(epsilon)
+        self.perturbation = to_tuple(perturbation)
+
+        # Compute the cartesian product of all hyperparameters
+        # (Except for the product of epsilon = 0.0 and multiple seed_perturbation because these are redundant)
+        epsilon_without_0 = [e for e in self.epsilon if e != 0.0]
+        epsilon_with_0 = (0.0,) if 0.0 in self.epsilon else ()
+
+        self.hyperparameters = list(
+            itertools.product(
+                self.momentum,
+                self.lr,
+                self.nesterov,
+                self.weight_decay,
+                self.n_hidden,
+                self.seed_weights,
+                (0,),
+                epsilon_with_0,
+                self.perturbation,
+            )
+        ) + list(
+            itertools.product(
+                self.momentum,
+                self.lr,
+                self.nesterov,
+                self.weight_decay,
+                self.n_hidden,
+                self.seed_weights,
+                self.seed_perturbation,
+                epsilon_without_0,
+                self.perturbation,
+            )
+        )
+        # Create a learner for each hyperparameter combination
+        self.learners = [
+            Learner.from_hyperparams(
+                model_cls=model_cls,
+                opt_cls=opt_cls,
+                momentum=momentum,
+                lr=lr,
+                nesterov=nesterov,
+                weight_decay=weight_decay,
+                n_hidden=n_hidden,
+                seed_weights=seed_weights,
+                seed_perturbation=seed_perturbation,
+                epsilon=epsilon,
+                perturbation=perturbation,
+                dir=dir,
+            )
+            for momentum, lr, nesterov, weight_decay, n_hidden, seed_weights, seed_perturbation, epsilon, perturbation in self.hyperparameters
+        ]
+
+        self.metrics = Metrics(self.baseline.model, self.train_dl, self.test_dl)
+
+    def train(self, n_epochs: int, start_epoch: int = 0, reset: bool = False):
+        if not reset:
+            self.load()
+            # self.plot()
+
+        step, batch_idx = 0, 0
+
+        for epoch in tqdm(range(start_epoch, n_epochs), desc="Training..."):
+            t.manual_seed(self.seed_dl + epoch)  # To shuffle the data
+
+            for batch_idx, batch in tqdm(
+                enumerate(self.train_dl), desc=f"Epoch {epoch}"
+            ):
+                step = epoch * len(self.train_dl) + batch_idx
+
+                for learner in self.learners:
+
+                    # Skip learners that have already been trained
+                    if learner.step >= step:
+                        continue
+
+                    learner.train_batch(epoch, batch_idx, step, batch)
+
+                if batch_idx % self.logging_ivl == 0:
+                    self.test(step=step, epoch=epoch, batch_idx=batch_idx)
+
+            self.test(step=step, epoch=epoch, batch_idx=batch_idx)
+            self.save(step=step)
+
+            self.plot(step=step, epoch=epoch, batch_idx=batch_idx)
+
+    def test(self, step, **kwargs):
+        learners = [learner for learner in self.learners if step not in learner.logs]
+        models = [learner.model for learner in learners]
+
+        for metric, learner in tqdm(
+            zip(self.metrics.measure(models), learners), desc=f"Testing {step}"
+        ):
+            learner.log(**metric, **kwargs)
+
+    @property
+    def comparisons(self) -> List[str]:
+        """Returns a list of the hyperparameters along which to compare models
+        (i.e. the hyperparameters that are provided as tuples)"""
+        return [
+            hp
+            for hp in (
+                "momentum",
+                "lr",
+                "nesterov",
+                "weight_decay",
+                "n_hidden",
+                "seed_weights",
+                "seed_perturbation",
+                "epsilon",
+                "perturbation",
+            )
+            if len(getattr(self, hp)) > 1
+        ]
+
+    def plot_panel(
+        self,
+        df: pd.DataFrame,
+        comparison: str,
+        metrics: List[str],
+        step: Optional[int] = None,
+        epoch: Optional[int] = None,
+        batch_idx: Optional[int] = None,
+        overwrite: bool = False,
+        **details,
+    ):
+        """Plots a panel of the given metrics for the given hyperparameter"""
+
+        series = df
+
+        baseline = series[series["epsilon"] == 0.0]
+
+        # Filter the series
+        for k, v in details.items():
+            series = series[series[k] == v]
+            details[k] = v
+
+            if k != "epsilon":
+                baseline = baseline[baseline[k] == v]
+
+        # Stable order
+        details = {k: v for k, v in sorted(details.items())}
+        details_rep = dict_to_latex(details)
+
+        if step is not None:
+            series = series[series["step"] <= step]
+            baseline = baseline[baseline["step"] <= step]
+        else:
+            step = series["step"].max().item()
+
+        comparison_values = series[comparison].unique()
+
+        # Check if the figure already exists
+        img_dir = self.dir / "img"
+        img_dir.mkdir(parents=True, exist_ok=True)
+        filepath = img_dir / f"{step}_{comparison}_{stable_hash(details_rep)}.png"
+
+        if filepath.exists() and not overwrite:
+            return
+
+        # Create a new figure
+        fig, axes = plt.subplots(
+            len(metrics) // 2, 2, figsize=(5 * 2, len(metrics) * 5 // 3)
+        )
+        fig.tight_layout(pad=5.0)
+
+        fig.suptitle(
+            f"Comparison over ${var_to_latex(comparison)}$\\ ($t\leq{step}, {details_rep}$)"
+        )
+
+        average = series.groupby("step").mean().reset_index()
+
+        # Plot each metric
+        for i, metric in enumerate(metrics):
+            ax = axes[i // 2][i % 2]
+
+            plot_baseline = metric in [
+                "L_train",
+                "acc_train",
+                "L_test",
+                "acc_test",
+            ]
+
+            # Plot the baseline
+            if plot_baseline:
+                ax.plot(
+                    baseline["step"], baseline[metric], label="baseline", color="black"
+                )
+
+            # Plot the average
+            ax.plot(average["step"], average[metric], label="average", color="red")
+
+            # Plot the other models
+            for comparison_value in comparison_values:
+                df_for_value = series[series[comparison] == comparison_value]
+
+                comparison_label = f"${var_to_latex(comparison)}={comparison_value}$"
+                ax.plot(
+                    df_for_value["step"],
+                    df_for_value[metric],
+                    label=comparison_label,
+                    alpha=0.25,
+                )
+
+            metric_rep = f"${var_to_latex(metric)}$"
+            ax.set_title(metric_rep)
+            ax.set_xlabel("step")
+            ax.set_ylabel(metric_rep)
+            ax.legend()
+
+        # Save the figure
+        # splt.show()
+
+        print(f"Saving figure to {filepath}")
+        fig.savefig(filepath)  # type: ignore
+
+    def plot(
+        self,
+        step: Optional[int] = None,
+        epoch: Optional[int] = None,
+        batch_idx: Optional[int] = None,
+    ):
+        df = self.df()
+        comparisons = self.comparisons
+
+        for comparison in comparisons:
+            # Plot a panel over a single comparison hyperparameter
+            # for all possible other hyperparameters held fixed
+
+            other_comparisons: List[str] = [c for c in comparisons if c != comparison]
+            other_hp_combos: Iterable[Tuple[Any, ...]] = itertools.product(
+                *[getattr(self, hp) for hp in other_comparisons]
+            )
+
+            for hp_combo in other_hp_combos:
+                details = dict(zip(other_comparisons, hp_combo))
+
+                self.plot_panel(
+                    df,
+                    comparison,
+                    metrics=self.metrics.keys(),
+                    step=step,
+                    epoch=epoch,
+                    batch_idx=batch_idx,
+                    **details,
+                )
+
+    def save(self, step: int, overwrite: bool = False):
+        for learner in self.learners:
+            learner.save(overwrite=overwrite)
+
+    def load(self, *args, **kwargs):
+        for learner in self.learners:
+            learner.load(*args, **kwargs)
+
+    def df(self):
+        """Returns a dataframe with the logs of all learners"""
+        return pd.concat([learner.df() for learner in self.learners])
+
+    @property
+    def models(self):
+        """Returns a list of all models"""
+        return [learner.model for learner in self.learners]
+
+    @property
+    def baseline(self):
+        """Returns the baseline learner"""
+        return self.learners[0]
+
+
+def get_mnist_dataloaders(batch_size: int = 64):
+    train_ds = datasets.MNIST(
+        root="data", train=True, download=True, transform=transforms.ToTensor()
+    )
+    test_ds = datasets.MNIST(
+        root="data", train=False, download=True, transform=transforms.ToTensor()
+    )
+
+    train_dl = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
+    test_dl = DataLoader(test_ds, batch_size=batch_size, shuffle=False)
+
+    return train_dl, test_dl
+
+
+train_dl, test_dl = get_mnist_dataloaders()
+
+# %%
+
+# Create the ensemble
+ensemble = Ensemble(
+    model_cls=MNIST,
+    opt_cls=t.optim.SGD,
+    train_dl=train_dl,
+    test_dl=test_dl,
+    dir="results",
+    logging_ivl=100,
+    seed_dl=0,
+    epsilon=(0.0, 0.01, 0.1),
+    seed_perturbation=(0, 1, 2, 3, 4, 5, 6, 7, 8, 9),
+)
+
+# %%
+
+ensemble.train(10)
+# %%

@@ -1,15 +1,7 @@
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import (
-    Callable,
-    Collection,
-    Container,
-    Iterable,
-    List,
-    Optional,
-    Sequence,
-    Type,
-)
+from typing import (Callable, Collection, Container, Iterable, List, Optional,
+                    Sequence, Type)
 
 import matplotlib as mpl
 import matplotlib.pyplot as plt
@@ -41,64 +33,65 @@ class WeightInitializer(ABC):  # TODO: Nake Generic
 
 
 @dataclass
-class AbsolutePerturbationInitializer(WeightInitializer):
-    """Copies over the weights from the first model to all other models,
-    then applies noise with norm epsilon to each of the other models."""
-
-    epsilon: float = 0.01
+class PerturbationInitializer(WeightInitializer, ABC):
+    seed_weights: int
+    seed_perturbation: int
+    epsilon: float = 0.0
     norm: Callable = t.norm
-    baseline: Optional[List[ExtendedModule]] = None
 
-    def __call__(self, *models: ExtendedModule):
-        # The first time this is called, we need to store the baseline weights
-        if self.baseline is None:
-            self.baseline = models[0]
-            models = models[1:]
+    def initialize_weights(self, model: ExtendedModule):
+        t.manual_seed(self.seed_weights)
+        model.init_weights()
 
-        parameters = list(self.baseline.parameters())
-        n_params = sum(p.numel() for p in parameters)
+    @abstractmethod
+    def apply_perturbation(self, model: ExtendedModule):
+        raise NotImplementedError
 
-        for model in models[1:]:
-            i = 0
+    def __call__(self, model: ExtendedModule):
+        self.initialize_weights(model)
+        self.apply_perturbation(model)
 
-            noise = t.randn(n_params)
-            noise = noise / self.norm(noise) * self.epsilon
-
-            for p, q in zip(parameters, model.parameters()):
-                q.data = p.data.clone() + noise[i : i + p.numel()].view(p.shape)
-                i += p.numel()
+    @property
+    @abstractmethod
+    def perturbation(self) -> str:
+        raise NotImplementedError
 
     @property
     def hyperparams(self) -> dict:
         return {
-            "weight_initialization": "absolute_perturbation",
+            "perturbation": self.perturbation,
             "epsilon": self.epsilon,
+            "seed_weights": self.seed_weights,
+            "seed_perturbation": self.seed_perturbation,
         }
 
 
 @dataclass
-class RelativePerturbationInitializer(WeightInitializer):
+class AbsolutePerturbationInitializer(PerturbationInitializer):
+    """Copies over the weights from the first model to all other models,
+    then applies noise with norm epsilon to each of the other models."""
+    
+    def apply_perturbation(self, model: ExtendedModule):
+        t.manual_seed(self.seed_perturbation)
+        model.parameters_vector += t.randn_like(model.parameters_vector) * self.epsilon
+
+    @property
+    def perturbation(self) -> str:
+        return "absolute"
+
+
+@dataclass
+class RelativePerturbationInitializer(PerturbationInitializer):
     """Copies over the weights from the first model to all other models,
     then applies noise with norm epsilon times the norm of the baseline model weights
      to each of the other models."""
 
-    epsilon: float = 0.01
-    norm: Callable = t.norm
     baseline: Optional[ExtendedModule] = None
 
-    def __call__(self, *models: ExtendedModule):
-        # The first time this is called, we need to store the baseline weights
-        if self.baseline is None:
-            self.baseline = models[0]
-
-        total_epsilon = (self.baseline.parameters_norm * self.epsilon).item()
-        absolute_perturber = AbsolutePerturbationInitializer(total_epsilon)
-
-        return absolute_perturber(*models)
+    def apply_perturbation(self, model: ExtendedModule):
+        t.manual_seed(self.seed_perturbation)
+        model.parameters_vector += t.randn_like(model.parameters_vector) * self.epsilon * model.parameters_norm
 
     @property
-    def hyperparams(self) -> dict:
-        return {
-            "weight_initialization": "relative_perturbation",
-            "epsilon": self.epsilon,
-        }
+    def perturbation(self) -> str:
+        return "relative"
