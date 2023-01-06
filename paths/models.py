@@ -1,6 +1,7 @@
 import math
 import warnings
 from abc import ABC, abstractmethod
+from collections import OrderedDict
 from pathlib import Path
 from typing import Callable, Optional, Tuple, TypedDict, Union
 
@@ -16,7 +17,7 @@ class ExtendedModule(nn.Module):
     def __init__(
         self,
         hyperparams: Optional[dict] = None,
-    ):
+    ):  
         self.hyperparams = hyperparams or {}
         super().__init__()
         # self.init_weights()
@@ -31,7 +32,6 @@ class ExtendedModule(nn.Module):
 
         for p in self.parameters():
             p.data = value[i : i + p.numel()].view(p.shape)
-
             i += p.numel()
 
     @property
@@ -42,13 +42,26 @@ class ExtendedModule(nn.Module):
     def parameters_norm(self, value: t.Tensor):
         self.parameters_vector *= value / self.parameters_norm
 
-    def _init_weights(self, module):
+    @staticmethod
+    def _init_weights(module):
         if isinstance(module, nn.Linear):
-            stdv = 1.0 / math.sqrt((module.weight.size(1)))
-            module.weight.data.uniform_(-stdv, stdv)
+            # Kaiming normal initialization (written by hand so we can constrain the norm of the matrix)
+            fan_in, fan_out = nn.init._calculate_fan_in_and_fan_out(module.weight)
+            n_params = fan_in * fan_out
+            gain = nn.init.calculate_gain("relu")
+            std = gain / math.sqrt(fan_in)
+
+            # For a matrix whose elements are sampled from a normal distribution with mean 0 and standard deviation std,
+            # the norm of the matrix is sqrt(fan_in) * std
+
+            # Make sure the weights are perfectly normalized
+            t.nn.init.normal_(module.weight.data)
+            module.weight.data *= math.sqrt(n_params) * std / t.norm(module.weight.data)
 
             if module.bias is not None:
-                module.bias.data.uniform_(-stdv, stdv)
+                # TODO: Not sure exactly how the bias should be initialized
+                t.nn.init.normal_(module.bias.data)
+                module.bias.data *= math.sqrt(fan_out) * std / t.norm(module.bias.data)
 
     def init_weights(self):
         self.apply(self._init_weights)
@@ -56,6 +69,10 @@ class ExtendedModule(nn.Module):
     @property
     def device(self) -> t.device:
         return next(self.parameters()).device
+
+    @property
+    def shape(self) -> OrderedDict:
+        return OrderedDict((name, p.shape) for name, p in self.state_dict().items())
 
 
 class MNISTHyperparams(TypedDict):

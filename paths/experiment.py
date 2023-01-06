@@ -1,6 +1,7 @@
 # %%
 import hashlib
 import itertools
+import os
 from dataclasses import dataclass, field
 from os import PathLike
 from pathlib import Path
@@ -24,6 +25,7 @@ import pandas as pd
 import torch as t
 import yaml
 from matplotlib import pyplot as plt
+from matplotlib.figure import Figure
 from torch import nn, optim
 from torch.nn import functional as F
 from torch.utils.data import DataLoader
@@ -52,7 +54,7 @@ def to_tuple(x: Hyperparameter[T]) -> Tuple[T, ...]:
 
 
 def get_opt_hyperparams(opt: optim.Optimizer) -> dict:
-    """Assumes that the optimizer has only a single set of hyperparameters
+    """Assumes that the optimizer has only a single set of hyperparams
     (and not a separate set for each parameter group)"""
     param_group = opt.param_groups[0]
 
@@ -73,7 +75,8 @@ class Metrics:
 
     class Report(TypedDict):
         d_w: Optional[float]
-        rel_d_w: Optional[float]
+        d_w_rel_to_init: Optional[float]
+        d_w_rel_to_norm: Optional[float]
         L_train: Optional[float]
         del_L_train: Optional[float]
         acc_train: Optional[float]
@@ -90,14 +93,42 @@ class Metrics:
     def d_w(self, model: ExtendedModule) -> t.Tensor:
         return t.norm(model.parameters_vector - self.baseline.parameters_vector)
 
-    def d_ws(self, models: List[ExtendedModule]) -> t.Tensor:
-        return t.tensor([self.d_w(model) for model in models])
+    def d_ws(self, learners: List["Learner"]) -> t.Tensor:
+        return t.tensor([self.d_w(learner.model) for learner in learners])
 
-    def d_ws_with_rel(self, models: List[ExtendedModule]) -> Tuple[t.Tensor, t.Tensor]:
-        d_ws = self.d_ws(models)
-        rel_d_ws = d_ws / self.baseline.parameters_norm
+    def d_ws_with_rel(self, learners: List["Learner"]) -> Tuple[t.Tensor, ...]:
+        d_ws = self.d_ws(learners)
 
-        return d_ws, rel_d_ws
+        # TODO: This will fail with absolute weight initializers
+        delta_norms = t.Tensor(
+            [learner.weight_initializer.delta_norm for learner in learners]
+        )
+        epsilons = t.Tensor(
+            [learner.weight_initializer.epsilon for learner in learners]
+        )
+        # init_norms = np.array(
+        #     [learner.weight_initializer.init_norm for learner in learners]
+        # )
+
+        d_ws_rel = d_ws - delta_norms
+        d_ws_rel_to_init = d_ws_rel / delta_norms
+        d_ws_rel_to_norm = d_ws_rel / (epsilons * self.baseline.parameters_norm)
+
+        return d_ws, d_ws_rel_to_init, d_ws_rel_to_norm
+
+    def w_norm(self, model: ExtendedModule) -> t.Tensor:
+        return model.parameters_norm
+
+    def w_norms(self, models: List[ExtendedModule]) -> t.Tensor:
+        return t.tensor([self.w_norm(model) for model in models])
+
+    def w_norms_with_rel(
+        self, models: List[ExtendedModule]
+    ) -> Tuple[t.Tensor, t.Tensor]:
+        w_norms = self.w_norms(models)
+        rel_w_norms = w_norms / self.baseline.parameters_norm
+
+        return w_norms, rel_w_norms
 
     def measure_model(
         self, model: ExtendedModule, data: t.Tensor, target: t.Tensor
@@ -190,9 +221,11 @@ class Metrics:
         """Returns the loss and accuracy averaged over the entire test set."""
         return self.data_set(models, self.train_dl)
 
-    def measure(self, models: List[ExtendedModule]) -> Iterable[Report]:
-        n_models = len(models)
-        d_ws, rel_d_ws = self.d_ws_with_rel(models)
+    def measure(self, learners: List["Learner"]) -> Iterable[Report]:
+        n_models = len(learners)
+        d_ws, d_ws_rel_to_init, d_ws_rel_to_norm = self.d_ws_with_rel(learners)
+
+        models = [learner.model for learner in learners]
 
         (
             L_train,
@@ -214,7 +247,8 @@ class Metrics:
         return [
             self.Report(
                 d_w=d_ws[i].item(),
-                rel_d_w=rel_d_ws[i].item(),
+                d_w_rel_to_init=d_ws_rel_to_init[i].item(),
+                d_w_rel_to_norm=d_ws_rel_to_norm[i].item(),
                 L_train=L_train[i].item(),
                 del_L_train=del_L_train[i].item(),
                 acc_train=acc_train[i].item(),
@@ -239,7 +273,8 @@ class Metrics:
     def keys(self) -> List[str]:
         return [
             "d_w",
-            "rel_d_w",
+            "d_w_rel_to_init",
+            "d_w_rel_to_norm",
             "L_train",
             "del_L_train",
             "acc_train",
@@ -378,7 +413,7 @@ class Learner:
             print(f"Could not load logs from {self.path / 'logs.csv'}")
             print(yaml.dump(self.hyperparams))
             self.logs = {}
-            return
+            return False
 
         try:
             self.model.load_state_dict(t.load(self.path_to_step / "model.pt"))
@@ -389,6 +424,9 @@ class Learner:
             )
         except FileNotFoundError:
             print(f"Could not load model or optimizer from {self.path_to_step}")
+            return False
+
+        return True
 
     @property
     def path_to_step(self):
@@ -424,10 +462,13 @@ class Learner:
     def df(self, full=True):
         """DataFrame of logs (add on hyperparams as cols)"""
         df = pd.DataFrame.from_dict(self.logs, orient="index")
-        df["step"] = df.index
+        # df["step"] = df.index
+        df = df.rename_axis("step").reset_index()
 
         if full:
             df = df.assign(**self.hyperparams)
+
+        print(df)
 
         return df
 
@@ -442,7 +483,7 @@ class Learner:
 class Ensemble:
     def __init__(
         self,
-        model_cls: Type[nn.Module],
+        model_cls: Type[ExtendedModule],
         opt_cls: Type[optim.Optimizer],
         train_dl: DataLoader,
         test_dl: DataLoader,
@@ -461,6 +502,9 @@ class Ensemble:
         seed_perturbation: Hyperparameter[int] = 0,
         epsilon: Hyperparameter[float] = 0.01,
         perturbation: Hyperparameter[Literal["absolute", "relative"]] = "relative",
+        plot_fns: Optional[Hyperparameter[Callable]] = None,
+        plot_ivl: int = 5000,
+        save_ivl: int = 2000,
     ):
         self.model_cls = model_cls
         self.opt_cls = opt_cls
@@ -471,7 +515,7 @@ class Ensemble:
         self.train_dl = train_dl
         self.test_dl = test_dl
 
-        # Turn hyperparameters into tuples
+        # Turn hyperparams into tuples
         self.momentum = to_tuple(momentum)
         self.lr = to_tuple(lr)
         self.nesterov = to_tuple(nesterov)
@@ -482,12 +526,12 @@ class Ensemble:
         self.epsilon = to_tuple(epsilon)
         self.perturbation = to_tuple(perturbation)
 
-        # Compute the cartesian product of all hyperparameters
+        # Compute the cartesian product of all hyperparams
         # (Except for the product of epsilon = 0.0 and multiple seed_perturbation because these are redundant)
         epsilon_without_0 = [e for e in self.epsilon if e != 0.0]
         epsilon_with_0 = (0.0,) if 0.0 in self.epsilon else ()
 
-        self.hyperparameters = list(
+        self.hyperparams = list(
             itertools.product(
                 self.momentum,
                 self.lr,
@@ -495,7 +539,7 @@ class Ensemble:
                 self.weight_decay,
                 self.n_hidden,
                 self.seed_weights,
-                (0,),
+                (0,),  # No seed_perturbation if epsilon=0.0
                 epsilon_with_0,
                 self.perturbation,
             )
@@ -528,17 +572,18 @@ class Ensemble:
                 perturbation=perturbation,
                 dir=dir,
             )
-            for momentum, lr, nesterov, weight_decay, n_hidden, seed_weights, seed_perturbation, epsilon, perturbation in self.hyperparameters
+            for momentum, lr, nesterov, weight_decay, n_hidden, seed_weights, seed_perturbation, epsilon, perturbation in self.hyperparams
         ]
 
         self.metrics = Metrics(self.baseline.model, self.train_dl, self.test_dl)
+        self.plot_fns = plot_fns or []
+        self.plot_ivl = plot_ivl
+        self.save_ivl = save_ivl
 
     def train(self, n_epochs: int, start_epoch: int = 0, reset: bool = False):
-        if not reset:
-            self.load()
-            # self.plot()
-
         step, batch_idx = 0, 0
+        for learner in self.learners:
+            learner.load()
 
         for epoch in tqdm(range(start_epoch, n_epochs), desc="Training..."):
             t.manual_seed(self.seed_dl + epoch)  # To shuffle the data
@@ -549,50 +594,291 @@ class Ensemble:
                 step = epoch * len(self.train_dl) + batch_idx
 
                 for learner in self.learners:
-
-                    # Skip learners that have already been trained
                     if learner.step >= step:
                         continue
 
                     learner.train_batch(epoch, batch_idx, step, batch)
 
-                if batch_idx % self.logging_ivl == 0:
+                if step % self.logging_ivl == 0:
                     self.test(step=step, epoch=epoch, batch_idx=batch_idx)
 
-            self.test(step=step, epoch=epoch, batch_idx=batch_idx)
-            self.save(step=step)
+                if step % self.plot_ivl == 0:
+                    self.plot(step=step, epoch=epoch, batch_idx=batch_idx)
 
-            self.plot(step=step, epoch=epoch, batch_idx=batch_idx)
+                if step % self.save_ivl == 0:
+                    self.save(step=step)
 
     def test(self, step, **kwargs):
         learners = [learner for learner in self.learners if step not in learner.logs]
-        models = [learner.model for learner in learners]
 
         for metric, learner in tqdm(
-            zip(self.metrics.measure(models), learners), desc=f"Testing {step}"
+            zip(self.metrics.measure(learners), learners), desc=f"Testing {step}"
         ):
             learner.log(**metric, **kwargs)
 
-    @property
-    def comparisons(self) -> List[str]:
-        """Returns a list of the hyperparameters along which to compare models
-        (i.e. the hyperparameters that are provided as tuples)"""
-        return [
-            hp
-            for hp in (
-                "momentum",
-                "lr",
-                "nesterov",
-                "weight_decay",
-                "n_hidden",
-                "seed_weights",
-                "seed_perturbation",
-                "epsilon",
-                "perturbation",
-            )
-            if len(getattr(self, hp)) > 1
-        ]
+    def plot(
+        self,
+        step: Optional[int] = None,
+        epoch: Optional[int] = None,
+        batch_idx: Optional[int] = None,
+    ):
+        df = self.df()
 
+        for plot_fn in self.plot_fns:
+            fig, ax = plot_fn(self, df, step=step, **self.fixed_hyperparams)
+
+            # Save the figure
+            if fig is not None:
+                fig.savefig(
+                    self.dir / f"img/{plot_fn.__name__}_{step}.png",
+                )
+
+    def save(self, step: int, overwrite: bool = False):
+        for learner in self.learners:
+            learner.save(overwrite=overwrite)
+
+    def load(self, *args, **kwargs):
+        for learner in self.learners:
+            learner.load(*args, **kwargs)
+
+    def df(self):
+        """Returns a dataframe with the logs of all learners"""
+        return pd.concat([learner.df() for learner in self.learners])
+
+    @property
+    def models(self):
+        """Returns a list of all models"""
+        return [learner.model for learner in self.learners]
+
+    @property
+    def baseline(self):
+        """Returns the baseline learner"""
+        return self.learners[0]
+
+    @property
+    def fixed_hyperparams(self):
+        """Returns a dictionary with the hyperparams that are fixed for all learners"""
+
+        hyperparams = {}
+        variable_hyperparams = set()
+
+        for learner in self.learners:
+            for name, value in learner.hyperparams.items():
+                if name in hyperparams and value != hyperparams[name]:
+                    variable_hyperparams.add(name)
+                    del hyperparams[name]
+                elif name not in hyperparams and name not in variable_hyperparams:
+                    hyperparams[name] = value
+
+        return hyperparams
+
+    def __getitem__(self, i):
+        return self.learners[i]
+
+    def __len__(self):
+        return len(self.learners)
+
+
+def get_mnist_dataloaders(batch_size: int = 64):
+    train_ds = datasets.MNIST(
+        root="data", train=True, download=True, transform=transforms.ToTensor()
+    )
+    test_ds = datasets.MNIST(
+        root="data", train=False, download=True, transform=transforms.ToTensor()
+    )
+
+    train_dl = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
+    test_dl = DataLoader(test_ds, batch_size=batch_size, shuffle=False)
+
+    return train_dl, test_dl
+
+
+train_dl, test_dl = get_mnist_dataloaders()
+
+
+def plot_metric_scaling(
+    ensemble: Ensemble,
+    df: pd.DataFrame,
+    step: Optional[int] = None,
+    metric: Tuple[str, ...] = ("d_w_by_eps", "d_w_rel_to_norm"),
+    comparison: str = "epsilon",
+    sample_axis: str = "seed_perturbation",
+    include_baseline: bool = True,  # Whether to plot the first value of comparison
+    **kwargs,
+) -> Tuple[Figure, List[List[plt.Axes]]]:
+    df = df.loc[df["step"] <= step]
+    metric_labels = tuple(var_to_latex(m) for m in metric)
+
+    comparison_label = var_to_latex(comparison)
+    comparison_values = getattr(ensemble, comparison)
+
+    if not include_baseline:
+        comparison_values = comparison_values[1:]
+
+    sample_values = df[sample_axis].unique()
+
+    if "perturbation" in kwargs:
+        del kwargs["perturbation"]
+
+    details = dict_to_latex(kwargs)
+
+    averages = df.groupby([comparison, "step"]).mean()
+    averages.reset_index(inplace=True)
+
+    steps = df["step"].unique()
+
+    # Figure is as wide as there are metrics and
+    # as tall as there are choices of `comparison` (+ 1 to compare averages)
+    fig, axes = plt.subplots(
+        len(comparison_values) + 1,
+        len(metric),
+        figsize=(len(metric) * 5, len(getattr(ensemble, comparison)) * 5),
+    )
+
+    # This works better with escaped LaTeX than f-strings. I think.
+    title = (
+        "$"
+        + " ? "
+        # str(metric_labels) +
+        "$ for $"
+        +
+        # str(comparison_label) +
+        "("
+        + ", ".join(map(lambda s: str(s), comparison_values))
+        + " )$\n($"
+        + details
+        + "$)"
+    )
+
+    fig.suptitle(title)
+    fig.tight_layout(pad=4.0)
+
+    for c, (m, m_label) in enumerate(zip(metric, metric_labels)):
+        for r, v in enumerate(comparison_values):
+            # Get the data for this comparison value
+            data = df.loc[df[comparison] == v]
+
+            # Plot the data
+            for sample in sample_values:
+                axes[r][c].plot(
+                    steps,
+                    data.loc[data[sample_axis] == sample][m].values,
+                    alpha=0.75,
+                    linewidth=0.5,
+                )
+
+            # Plot the average across samples
+            axes[r][c].plot(
+                steps,
+                averages.loc[averages[comparison] == v][m].values,
+                color="black",
+                linestyle="--",
+            )
+
+            axes[r][c].set_title(f"${m_label}$ for ${comparison_label} = {v}$")
+            axes[r][c].set_xlabel("Step $t$")
+            axes[r][c].set_ylabel(f"${m_label}$")
+
+    # Plot the comparison of averages
+    for c, (m, m_label) in enumerate(zip(metric, metric_labels)):
+
+        # Plot the averages across comparison values
+        for v in comparison_values:
+            axes[-1][c].plot(
+                steps,
+                averages.loc[averages[comparison] == v][m].values,
+                label=f"${v}$",
+            )
+
+        axes[-1][c].set_title(f"${m_label}$ across ${comparison_label}$")
+        axes[-1][c].set_xlabel("Step $t$")
+        axes[-1][c].set_ylabel(f"$\\overline{{{m_label}}}$")
+        axes[-1][c].legend()
+
+    return fig, axes
+
+
+# %%
+
+
+# Create the ensemble
+# ensemble1 = Ensemble(
+#     model_cls=MNIST,
+#     opt_cls=t.optim.SGD,
+#     train_dl=train_dl,
+#     test_dl=test_dl,
+#     dir="results",
+#     logging_ivl=100,
+#     seed_dl=0,
+#     # n_hidden=(10, 50, 100, 1000),
+#     # n_hidden=(10, 50, 100),
+#     n_hidden=50,
+#     # lr=(0.001, 0.01, 0.1),
+#     # weight_decay=(0.0, 0.1, 0.5, 0.9),
+#     weight_decay=(0.0, 0.1),
+#     # momentum=(0.0, 0.1, 0.5, 0.9),
+#     momentum=(0.0, 0.1),
+#     epsilon=(0.0, 0.01, 0.1),
+#     seed_perturbation=tuple(i for i in range(25)),
+# )
+
+# ensemble1.train(50)
+
+# ensemble2 = Ensemble(
+#     model_cls=MNIST,
+#     opt_cls=t.optim.SGD,
+#     train_dl=train_dl,
+#     test_dl=test_dl,
+#     dir="results",
+#     logging_ivl=100,
+#     seed_dl=0,
+#     epsilon=0.01,
+#     momentum=(0.0, 0.1, 0.5, 0.9),
+#     seed_perturbation=tuple(i for i in range(50)),
+# )
+
+# ensemble2.train(50)
+
+
+def epsilon_scaling(
+    ensemble: Ensemble, df: pd.DataFrame, step: Optional[int] = None, **kwargs
+):
+    return plot_metric_scaling(
+        ensemble,
+        df,
+        step=step,
+        metric=("d_w_rel_to_init", "d_w_rel_to_norm"),
+        comparison="epsilon",
+        sample_axis="seed_perturbation",
+        include_baseline=False,
+        **kwargs,
+    )
+
+
+ensemble = Ensemble(
+    model_cls=MNIST,
+    opt_cls=t.optim.SGD,
+    train_dl=train_dl,
+    test_dl=test_dl,
+    dir="results",
+    logging_ivl=100,
+    seed_dl=1,
+    epsilon=(0.0, 0.001, 0.01, 0.1, 1.0),
+    # n_hidden=([784, 100, 50, 30, 10],),
+    # momentum=(0.0, 0.1, 0.5, 0.9),
+    # weight_decay=(0.0, 0.001, 0.01, 0.1, 0.5, 0.9),
+    seed_perturbation=tuple(i for i in range(10)),
+    plot_fns=(epsilon_scaling,),
+    plot_ivl=1000,
+)
+
+ensemble.train(10)
+
+
+# %%
+
+
+def plot_metric_panel() -> Tuple[Figure, List[List[plt.Axes]]]:
     def plot_panel(
         self,
         df: pd.DataFrame,
@@ -675,6 +961,10 @@ class Ensemble:
                 df_for_value = series[series[comparison] == comparison_value]
 
                 comparison_label = f"${var_to_latex(comparison)}={comparison_value}$"
+
+                if comparison == "seed_perturbation":
+                    comparison_label = f"_{comparison_value}"  # Hidden from legend
+
                 ax.plot(
                     df_for_value["step"],
                     df_for_value[metric],
@@ -705,7 +995,7 @@ class Ensemble:
 
         for comparison in comparisons:
             # Plot a panel over a single comparison hyperparameter
-            # for all possible other hyperparameters held fixed
+            # for all possible other hyperparams held fixed
 
             other_comparisons: List[str] = [c for c in comparisons if c != comparison]
             other_hp_combos: Iterable[Tuple[Any, ...]] = itertools.product(
@@ -725,61 +1015,9 @@ class Ensemble:
                     **details,
                 )
 
-    def save(self, step: int, overwrite: bool = False):
-        for learner in self.learners:
-            learner.save(overwrite=overwrite)
-
-    def load(self, *args, **kwargs):
-        for learner in self.learners:
-            learner.load(*args, **kwargs)
-
-    def df(self):
-        """Returns a dataframe with the logs of all learners"""
-        return pd.concat([learner.df() for learner in self.learners])
-
-    @property
-    def models(self):
-        """Returns a list of all models"""
-        return [learner.model for learner in self.learners]
-
-    @property
-    def baseline(self):
-        """Returns the baseline learner"""
-        return self.learners[0]
+                if comparison in ("epsilon", "momentum", "lr", "weight_decay"):
+                    # We only want to plot the panel over epsilon for one choice of seed perturbation
+                    break
 
 
-def get_mnist_dataloaders(batch_size: int = 64):
-    train_ds = datasets.MNIST(
-        root="data", train=True, download=True, transform=transforms.ToTensor()
-    )
-    test_ds = datasets.MNIST(
-        root="data", train=False, download=True, transform=transforms.ToTensor()
-    )
-
-    train_dl = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
-    test_dl = DataLoader(test_ds, batch_size=batch_size, shuffle=False)
-
-    return train_dl, test_dl
-
-
-train_dl, test_dl = get_mnist_dataloaders()
-
-# %%
-
-# Create the ensemble
-ensemble = Ensemble(
-    model_cls=MNIST,
-    opt_cls=t.optim.SGD,
-    train_dl=train_dl,
-    test_dl=test_dl,
-    dir="results",
-    logging_ivl=100,
-    seed_dl=0,
-    epsilon=(0.0, 0.01, 0.1),
-    seed_perturbation=(0, 1, 2, 3, 4, 5, 6, 7, 8, 9),
-)
-
-# %%
-
-ensemble.train(10)
 # %%

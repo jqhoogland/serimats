@@ -25,7 +25,6 @@ import torch as t
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-import wandb
 from torch.utils.data import DataLoader
 from torchvision import datasets, transforms
 
@@ -34,14 +33,14 @@ def setup() -> str:
     device = "cuda" if t.cuda.is_available() else "cpu"
 
     mpl.rcParams["text.usetex"] = True
-    mpl.rcParams[
-        "text.latex.preamble"
-    ] = []  # [r"\usepackage{amsmath}"]  # for \text command
+    # mpl.rcParams[
+    #     "text.latex.preamble"
+    # ] = [r"\usepackage{amsmath}"]  # for \text command
     mpl.rcParams["figure.dpi"] = 300
     plt.style.use("ggplot")
     t.device(device)
 
-    wandb.login()
+    # wandb.login()
 
     return device
 
@@ -71,15 +70,18 @@ VARS = {
     "acc_compare": r"\mathrm{acc}_\mathrm{compare}",
     "acc_train_compare": r"\mathrm{acc}_\mathrm{cf. train}",
     "acc_test_compare": r"\mathrm{acc}_\mathrm{cf. test}",
-    "d_w": r"d_\mathbf{w}",
+    # "d_w": r"d_\mathcal{W}",
+    "d_w": r"d_W",
     "del_L_train": r"\delta L_\mathrm{train}",
     "del_L_test": r"\delta L_\mathrm{test}",
     "del_acc_test": r"\delta \mathrm{acc}_\mathrm{test}",
     "del_acc_train": r"\delta \mathrm{acc}_\mathrm{train}",
-    "rel_d_w": r"\frac{d_\mathbf{w}}{|\mathbf{w}_\mathrm{ref}|}",
-    "seed_weights": r"\mathbf{w}_\mathrm{ref}",
-    "seed_perturbation": r"\delta \mathbf{w}^{(0)}",
-    "perturbation": "\mathrm{perturbation type}",
+    # "d_w_rel_to_norm": r"\frac{d_\mathcal{W}}{|\mathbf{w}_\mathrm{ref}|}",
+    "d_w_rel_to_norm": r"\frac{d_W - |\delta|}{|\delta|\cdot|\mathbf{w}_\mathrm{ref}^{(t)}|}",
+    "d_w_rel_to_init": r"\frac{d_W - |\delta|}{|\delta|\cdot|\mathbf{w}_\mathrm{ref}^{(0)}|}",
+    "seed_weights": r"s_{\mathbf w_0}",
+    "seed_perturbation": r"s_{\delta}",
+    "perturbation": r"\mathrm{perturbation type}",
 }
 
 
@@ -219,7 +221,7 @@ class Plotter:
         "L_compare",
         "acc_compare",
         "d_w",
-        "rel_d_w",
+        "d_w_rel_to_norm",
     ]
 
     def plot(self, df: pd.DataFrame, **kwargs):
@@ -245,7 +247,7 @@ class Plotter:
 
             include_baseline = metric not in (
                 "d_w",
-                "rel_d_w",
+                "d_w_rel_to_norm",
                 "del_L_train",
                 "del_L_test",
                 "del_acc_test",
