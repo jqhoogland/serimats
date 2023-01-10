@@ -1,20 +1,11 @@
+import hashlib
 import warnings
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import (
-    Any,
-    Collection,
-    Container,
-    Dict,
-    Iterable,
-    List,
-    Optional,
-    Sequence,
-    Tuple,
-    Type,
-    Union,
-)
+from typing import (Any, Callable, Collection, Container, Dict, Generic,
+                    Iterable, List, Optional, Protocol, Sequence, Tuple, Type,
+                    TypeVar, Union)
 
 import matplotlib as mpl
 import matplotlib.pyplot as plt
@@ -45,9 +36,51 @@ def setup() -> str:
     return device
 
 
+T = TypeVar("T")
+OptionalTuple = Union[T, Tuple[T, ...]]
+
+
+def stable_hash(x: Any) -> str:
+    return hashlib.sha256(str(x).encode("utf-8")).hexdigest()[:32]
+
+
+def to_tuple(x: OptionalTuple[T]) -> Tuple[T, ...]:
+    return x if isinstance(x, tuple) else (x,)
+
+
 def get_parameters(model: nn.Module) -> t.Tensor:
     """Get a flattened tensor of all parameters in a model."""
     return t.cat([p.view(-1) for p in model.parameters()])
+
+
+def tensor_map(f: Callable[..., float], *args):
+    """Map a function that returns a float over a (collection of) iterables, 
+    then wrap the result in a tensor."""
+    return t.tensor([f(*arg) for arg in zip(*args)])
+ 
+
+# Latex & typesetting
+
+class WithLatex(Protocol):
+    __latex__: Tuple[str, str]
+
+
+class CallableWithLatex(WithLatex, Protocol):
+    __name__: str
+    
+    def __call__(self, *args, **kwargs) -> Any:
+        ...
+
+
+def add_latex(name: str, body: str):
+    """Add a latex representation to a function (of the function name & body)."""
+    
+    def decorator(f) -> CallableWithLatex:
+        f.__latex__ = (name, body)
+
+        return f
+
+    return decorator
 
 
 VARS = {
@@ -63,22 +96,27 @@ VARS = {
     "L_test": r"L_\mathrm{test}",
     "L_train": r"L_\mathrm{train}",
     "L_compare": r"L_\mathrm{compare}",
-    "L_train_compare": r"L_\mathrm{cf. train}",
-    "L_test_compare": r"L_\mathrm{cf. test}",
+    "L_compare_train": r"L_\mathrm{cf. train}",
+    "L_compare_test": r"L_\mathrm{cf. test}",
     "acc_train": r"\mathrm{acc}_\mathrm{train}",
     "acc_test": r"\mathrm{acc}_\mathrm{test}",
     "acc_compare": r"\mathrm{acc}_\mathrm{compare}",
-    "acc_train_compare": r"\mathrm{acc}_\mathrm{cf. train}",
-    "acc_test_compare": r"\mathrm{acc}_\mathrm{cf. test}",
-    # "d_w": r"d_\mathcal{W}",
+    "acc_compare_train": r"\mathrm{acc}_\mathrm{cf. train}",
+    "acc_compare_test": r"\mathrm{acc}_\mathrm{cf. test}",
+    "w": r"|w|",
+    "w_normed": r"|w|/|w^{(0)}|",
     "d_w": r"d_W",
-    "del_L_train": r"\delta L_\mathrm{train}",
-    "del_L_test": r"\delta L_\mathrm{test}",
-    "del_acc_test": r"\delta \mathrm{acc}_\mathrm{test}",
-    "del_acc_train": r"\delta \mathrm{acc}_\mathrm{train}",
-    # "d_w_rel_to_norm": r"\frac{d_\mathcal{W}}{|\mathbf{w}_\mathrm{ref}|}",
-    "d_w_rel_to_norm": r"\frac{d_W - |\delta|}{|\delta|\cdot|\mathbf{w}_\mathrm{ref}^{(t)}|}",
-    "d_w_rel_to_init": r"\frac{d_W - |\delta|}{|\delta|\cdot|\mathbf{w}_\mathrm{ref}^{(0)}|}",
+    "delta_L_train": r"\delta L_\mathrm{train}",
+    "delta_L_test": r"\delta L_\mathrm{test}",
+    "delta_acc_test": r"\delta \mathrm{acc}_\mathrm{test}",
+    "delta_acc_train": r"\delta \mathrm{acc}_\mathrm{train}",
+    "d_w_from_baseline": r"d_W(w^{(t)}, w_\mathrm{ref}^{(t)})",
+    "d_w_from_init": r"d_W(w^{(t)}, w^{(0)})",
+    # TODO angle between w and w_ref & angle between w and w_init
+    "d_w_from_baseline_normed": r"\hat{d}_W(w^{(t)}, w_\mathrm{ref}^{(t)})",
+    "d_w_from_init_normed": r"\hat{d}_W(w^{(t)}, w^{(0)})",
+    "w_corr_with_baseline": r"w^{(t)} \cdot w_\mathrm{ref}^{(t)})",
+    "w_autocorr": r"w^{(t)} \cdot w^{(0)})",
     "seed_weights": r"s_{\mathbf w_0}",
     "seed_perturbation": r"s_{\delta}",
     "perturbation": r"\mathrm{perturbation type}",

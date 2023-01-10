@@ -23,6 +23,10 @@ class ExtendedModule(nn.Module):
         # self.init_weights()
 
     @property
+    def n_parameters(self) -> int:
+        return sum(p.numel() for p in self.parameters())
+
+    @property
     def parameters_vector(self) -> t.Tensor:
         return get_parameters(self)
 

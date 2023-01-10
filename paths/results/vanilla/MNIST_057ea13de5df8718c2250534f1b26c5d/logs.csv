@@ -1,0 +1,2 @@
+,step,w,d_w_from_baseline,d_w_from_init,w_corr_with_baseline,w_autocorr,cos_sim_from_baseline,cos_sim_from_init,w_normed,d_w_from_baseline_normed,d_w_from_init_normed,L_compare_train,acc_compare_train,L_compare_test,acc_compare_test,epoch,batch_idx
+0,0,14.847725868225098,14.835161209106445,0.0,110.41394805908203,0.0027726704720407724,0.5008456110954285,1.0,1.0,1.0,0.0,2.145465612411499,0.10713333636522293,2.1489500999450684,0.10289999842643738,0,0

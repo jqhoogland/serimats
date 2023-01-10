@@ -30,6 +30,7 @@ from serimats.paths.models import ExtendedModule
 
 class WeightInitializer(ABC):  # TODO: Nake Generic
     """A class that, when called, jointly initializes a sequence of models"""
+    initial_weights: Optional[t.Tensor]
 
     @abstractmethod
     def __call__(self, *models: nn.Module):
@@ -51,11 +52,11 @@ class PerturbationInitializer(WeightInitializer, ABC):
     still follow the same distribution as the weights before the perturbation.
 
     """
-
     seed_weights: int
     seed_perturbation: int
     epsilon: float = 0.0
     norm: Callable = t.norm
+    initial_weights: Optional[t.Tensor] = None
 
     def initialize_weights(self, model: ExtendedModule):
         t.manual_seed(self.seed_weights)
@@ -68,6 +69,7 @@ class PerturbationInitializer(WeightInitializer, ABC):
     def __call__(self, model: ExtendedModule):
         self.initialize_weights(model)
         self.apply_perturbation(model)
+        self.initial_weights = model.parameters_vector
 
     @property
     @abstractmethod
