@@ -17,17 +17,20 @@ from matplotlib import pyplot as plt
 from matplotlib.figure import Figure
 from torch import nn, optim
 from torch.nn import functional as F
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Dataset
 from torchvision import datasets, transforms
 from tqdm import tqdm
 
-from serimats.paths.metrics import Metrics
+from serimats.paths.metrics import (Metrics, cos_sim_from_baseline,
+                                    cos_sim_from_init, d_w_from_baseline,
+                                    d_w_from_baseline_normed, d_w_from_init,
+                                    d_w_from_init_normed, w_autocorr,
+                                    w_corr_with_baseline, w_normed)
 from serimats.paths.models import MNIST, ExtendedModule
-from serimats.paths.plots import (corr_scaling, cos_sim_scaling,
-                                  epsilon_scaling, loss_scaling,
-                                  plot_metric_scaling)
-from serimats.paths.utils import (OptionalTuple, dict_to_latex, setup,
-                                  stable_hash, to_tuple, var_to_latex)
+from serimats.paths.plots import plot_metric_scaling
+from serimats.paths.utils import (CallableWithLatex, OptionalTuple,
+                                  dict_to_latex, setup, stable_hash, to_tuple,
+                                  var_to_latex)
 from serimats.paths.weights import (AbsolutePerturbationInitializer,
                                     RelativePerturbationInitializer)
 
@@ -250,16 +253,14 @@ class Ensemble:
         self,
         model_cls: Type[ExtendedModule],
         opt_cls: Type[optim.Optimizer],
-        train_dl: DataLoader,
-        test_dl: DataLoader,
+        train_data: Dataset,
+        test_data: Dataset,
         seed_dl: int,
         dir: str,
+        batch_size: int = 64,
         logging_ivl: int = 100,
         # Optimizer
-        momentum: OptionalTuple[float] = 0.0,
-        lr: OptionalTuple[float] = 0.01,
-        nesterov: OptionalTuple[bool] = False,
-        weight_decay: OptionalTuple[float] = 0.0,
+        opt_kwargs: OptionalTuple[Dict[str, Any]] = {},
         # Model
         n_hidden: OptionalTuple[Union[int, List[int]]] = 100,
         # Weight initialization
@@ -277,14 +278,20 @@ class Ensemble:
         self.dir = Path(dir)
         self.logging_ivl = logging_ivl
 
+        train_dl = DataLoader(train_data, batch_size=batch_size, shuffle=True)
+        test_dl = DataLoader(test_data, batch_size=batch_size, shuffle=False)
+
         self.train_dl = train_dl
         self.test_dl = test_dl
 
         # Turn hyperparams into tuples
-        self.momentum = to_tuple(momentum)
-        self.lr = to_tuple(lr)
-        self.nesterov = to_tuple(nesterov)
-        self.weight_decay = to_tuple(weight_decay)
+        if isinstance(opt_kwargs, dict):
+            self.opt_kwargs = {
+                k: to_tuple(v) for k, v in opt_kwargs.items() if v is not None
+            }   
+        else:
+            raise NotImplementedError
+        
         self.n_hidden = to_tuple(n_hidden)
         self.seed_weights = to_tuple(seed_weights)
         self.seed_perturbation = to_tuple(seed_perturbation)
@@ -298,27 +305,21 @@ class Ensemble:
 
         self.hyperparams = list(
             itertools.product(
-                self.momentum,
-                self.lr,
-                self.nesterov,
-                self.weight_decay,
                 self.n_hidden,
                 self.seed_weights,
                 (0,),  # No seed_perturbation if epsilon=0.0
                 epsilon_with_0,
                 self.perturbation,
+                *self.opt_kwargs.values(),
             )
         ) + list(
             itertools.product(
-                self.momentum,
-                self.lr,
-                self.nesterov,
-                self.weight_decay,
                 self.n_hidden,
                 self.seed_weights,
                 self.seed_perturbation,
                 epsilon_without_0,
                 self.perturbation,
+                *self.opt_kwargs.values(),
             )
         )
         # Create a learner for each hyperparameter combination
@@ -326,18 +327,18 @@ class Ensemble:
             Learner.from_hyperparams(
                 model_cls=model_cls,
                 opt_cls=opt_cls,
-                momentum=momentum,
-                lr=lr,
-                nesterov=nesterov,
-                weight_decay=weight_decay,
                 n_hidden=n_hidden,
                 seed_weights=seed_weights,
                 seed_perturbation=seed_perturbation,
                 epsilon=epsilon,
                 perturbation=perturbation,
-                dir=dir
+                dir=dir,
+                **{
+                    k: v
+                    for k, v in zip(self.opt_kwargs.keys(), opt_args)
+                }
             )
-            for momentum, lr, nesterov, weight_decay, n_hidden, seed_weights, seed_perturbation, epsilon, perturbation in self.hyperparams
+            for n_hidden, seed_weights, seed_perturbation, epsilon, perturbation, *opt_args in self.hyperparams
         ]
 
         # Add baselines
@@ -348,7 +349,8 @@ class Ensemble:
                 del hp["epsilon"]
                 learner.baseline = next(self.filter_learners(**hp))
             else:
-                learner.baseline = self.learners[0]
+                pass
+                # learner.baseline = self.learners[0]
 
         self.metrics = Metrics(self.train_dl, self.test_dl)
         self.plot_fns = to_tuple(plot_fns) if plot_fns else []
@@ -377,7 +379,7 @@ class Ensemble:
                 if step % self.logging_ivl == 0:
                     self.test(step=step, epoch=epoch, batch_idx=batch_idx)
 
-                if step % self.plot_ivl == 0 and step > 0:
+                if step % self.plot_ivl == 0: # and step > 0:
                     self.plot(step=step)
 
                 if step % self.save_ivl == 0:
@@ -394,6 +396,8 @@ class Ensemble:
 
     def plot(self, step: Optional[int] = None):
         df = self.df()
+        fig_dir = self.dir / "img"
+        fig_dir.mkdir(parents=True, exist_ok=True)
 
         for plot_fn in self.plot_fns:
             fig, ax = plot_fn(self, df, step=step, **self.fixed_hyperparams)
@@ -401,7 +405,7 @@ class Ensemble:
             # Save the figure
             if fig is not None:
                 fig.savefig(
-                    str(self.dir / f"img/{plot_fn.__name__}_{step}.png"),
+                    str(fig_dir / f"{plot_fn.__name__}_{step}.png"),
                 )
 
     def save(self, step: int, overwrite: bool = False):
@@ -454,7 +458,7 @@ class Ensemble:
         return len(self.learners)
 
 
-def get_mnist_dataloaders(batch_size: int = 64):
+def get_mnist_data():
     train_ds = datasets.MNIST(
         root="data", train=True, download=True, transform=transforms.ToTensor()
     )
@@ -462,13 +466,10 @@ def get_mnist_dataloaders(batch_size: int = 64):
         root="data", train=False, download=True, transform=transforms.ToTensor()
     )
 
-    train_dl = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
-    test_dl = DataLoader(test_ds, batch_size=batch_size, shuffle=False)
-
-    return train_dl, test_dl
+    return train_ds, test_ds
 
 
-train_dl, test_dl = get_mnist_dataloaders()
+train_data, test_data = get_mnist_data()
 
 
 
@@ -477,57 +478,147 @@ train_dl, test_dl = get_mnist_dataloaders()
 defaults = dict(
     model_cls=MNIST,
     opt_cls=t.optim.SGD,
-    train_dl=train_dl,
-    test_dl=test_dl,
+    train_data=train_data,
+    test_data=test_data,
+    batch_size=64,
     logging_ivl=100,
     plot_ivl=1000,
     save_ivl=2000,
-    plot_fns=(epsilon_scaling, corr_scaling, cos_sim_scaling, loss_scaling),
+    plot_fns=(),
     seed_dl=0,
     epsilon=0.01,
     n_hidden=100,
-    momentum=0.0,
-    weight_decay=0.0,
     seed_perturbation=tuple(i for i in range(10)),
+    opt_kwargs=dict(
+        momentum=0.0,
+        weight_decay=0.0,
+    )
 )
 
+
 experiments = [
-    {
-        "epsilon": (0.0, 0.001, 0.01, 0.1, 1.0), 
-        "dir": "results/vanilla"
-    },
+    # {
+    #     "epsilon": (0.0, 0.001, 0.01, 0.1, 1.0), 
+    #     "dir": "results/mnist/vanilla"
+    # },
     {
         # Depth
         "epsilon": (0.0, 0.01),
-        "n_hidden": ([784, 50, 10], [784, 50, 50, 10], [784, 50, 50, 50, 10], [784, 50, 50, 50, 50,]),
-        "dir": "results/depth"
+        "n_hidden": ([50], [50] * 2, [50] * 3, [50] * 4, [50] * 5,),
+        "dir": "results/mnist/depth"
     },
     {
         # Width
         "epsilon": (0.0, 0.01),
         "n_hidden": (400, 200, 100, 50, 25,),
-        "dir": "results/width"
+        "dir": "results/mnist/width"
     },
-    {
-        # Momentum
-        "epsilon": (0.0, 0.01),
-        "momentum": (0.0, 0.1, 0.5, 0.9),
-        "dir": "results/momentum"
-    },
-    {
-        # Weight decay
-        "epsilon": (0.0, 0.01),
-        "weight_decay": (0.0, 0.001, 0.01, 0.1, 0.5, 0.9),
-        "dir": "results/weight_decay"
-    },
+    # {
+    #     # Momentum
+    #     "epsilon": (0.0, 0.01),
+    #     "momentum": (0.0, 0.1, 0.5, 0.9),
+    #     "dir": "results/mnist/momentum"
+    # },
+    # {
+    #     # Weight decay
+    #     "epsilon": (0.0, 0.01),
+    #     "weight_decay": (0.0, 0.001, 0.01, 0.1, 0.5, 0.9),
+    #     "dir": "results/mnist/weight_decay"
+    # },
+    # {
+    #     # Optimizer
+    #     "opt_cls": t.optim.Adam,
+    # }
 ]
 
 for experiment in experiments:
+    comparison = (set(experiment.keys()) - {"dir", "epsilon"}).pop()
+
+    def epsilon_scaling(
+        ensemble: "Ensemble", df: pd.DataFrame, step: Optional[int] = None, **kwargs
+    ):
+        return plot_metric_scaling(
+            ensemble,
+            # df,
+            df.loc[df["epsilon"] > 0.0],
+            step=step,
+            metric=(w_normed, d_w_from_baseline_normed, d_w_from_init_normed),
+            comparison=comparison,
+            sample_axis="seed_perturbation",
+            include_baseline=False,
+            **kwargs,
+        )
+
+
+    def corr_scaling(
+        ensemble: "Ensemble", df: pd.DataFrame, step: Optional[int] = None, **kwargs
+    ):
+        return plot_metric_scaling(
+            ensemble,
+            # df,
+            df.loc[df["epsilon"] > 0.0],
+            step=step,
+            metric=(w_corr_with_baseline, w_autocorr),
+            comparison=comparison,
+            sample_axis="seed_perturbation",
+            include_baseline=True,
+            **kwargs,
+        )
+
+
+    def cos_sim_scaling(
+        ensemble: "Ensemble", df: pd.DataFrame, step: Optional[int] = None, **kwargs
+    ):
+        return plot_metric_scaling(
+            ensemble,
+            # df,
+            df.loc[df["epsilon"] > 0.0],
+            step=step,
+            metric=(cos_sim_from_baseline, cos_sim_from_init),
+            comparison=comparison,
+            sample_axis="seed_perturbation",
+            include_baseline=True,
+            **kwargs,
+        )
+
+
+
+    def loss_scaling(
+        ensemble: "Ensemble", df: pd.DataFrame, step: Optional[int] = None, **kwargs
+    ):
+        def mock_metric(name, latex_name, latex_body="") -> CallableWithLatex:
+            def metric(*args, **kwargs):
+                pass
+
+            metric.__name__ = name
+            metric.__latex__ = (latex_name, latex_body)
+
+            return metric  # type: ignore
+
+        L_compare_train = mock_metric("L_compare_train", r"L_\mathrm{cf. train}")
+        L_compare_test = mock_metric("L_compare_test", r"L_\mathrm{cf. test}")
+
+        acc_compare_train = mock_metric("acc_compare_train", r"acc_\mathrm{cf. train}")
+        acc_compare_test = mock_metric("acc_compare_test", r"acc_\mathrm{cf. test}")
+
+        return plot_metric_scaling(
+            ensemble,
+            # df,
+            df.loc[df["epsilon"] > 0.0],
+            step=step,
+            metric=(L_compare_train, L_compare_test, acc_compare_train, acc_compare_test),
+            comparison=comparison,
+            sample_axis="seed_perturbation",
+            include_baseline=True,
+            **kwargs,
+        )
+
     kwargs = {**defaults}
     kwargs.update(experiment)
+    kwargs['plot_fns'] = (epsilon_scaling, corr_scaling, cos_sim_scaling, loss_scaling)
 
     ensemble = Ensemble(**kwargs) # type: ignore
-    ensemble.train(50)
+    ensemble.train(20)
 
 
 # %%

@@ -86,7 +86,7 @@ class MNISTHyperparams(TypedDict):
 class MNIST(ExtendedModule):
     """A simple MNIST classifier with a variable number of hidden layers."""
 
-    n_hidden: Union[int, Tuple[int, ...]]
+    n_hidden: Union[int, str]
 
     def __init__(self, hyperparams: Optional[MNISTHyperparams] = None, **kwargs):
         super().__init__(hyperparams=hyperparams, **kwargs)  # type: ignore
@@ -95,6 +95,11 @@ class MNIST(ExtendedModule):
 
         if isinstance(n_hidden, int):
             n_hidden = (784, n_hidden, 10)
+        else:
+            n_hidden = (784, *n_hidden, 10)
+
+            # self.n_hidden = str(n_hidden)
+            # self.hyperparams["n_hidden"] = self.n_hidden
 
         fc_layers = [
             nn.Linear(n_hidden[i], n_hidden[i + 1]) for i in range(len(n_hidden) - 1)
