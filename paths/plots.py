@@ -47,6 +47,7 @@ def plot_metric_scaling(
     comparison: str = "epsilon",
     sample_axis: str = "seed_perturbation",
     include_baseline: bool = True,  # Whether to plot the first value of comparison
+    baseline: dict = {"epsilon": 0.},
     **kwargs,
 ) -> Tuple[Figure, List[List[plt.Axes]]]:
     if step:
@@ -55,8 +56,8 @@ def plot_metric_scaling(
     metric_labels = tuple(m.__latex__[0] for m in metric)
 
     comparison_label = var_to_latex(comparison)
-    comparison_values = getattr(ensemble, comparison)
-
+    comparison_values = df[comparison].unique().tolist()
+   
     if not include_baseline:
         comparison_values = comparison_values[1:]
 
@@ -65,7 +66,13 @@ def plot_metric_scaling(
 
     details = dict_to_latex(kwargs)
 
-    averages = df.groupby([comparison, "step"]).mean()
+    averages = df
+    
+    if not include_baseline:
+        for k, v in baseline.items():
+            averages = averages.loc[averages[k] != v]
+
+    averages = averages.groupby([comparison, "step"]).mean()
     averages.reset_index(inplace=True)
 
     steps = df["step"].unique()
@@ -75,7 +82,7 @@ def plot_metric_scaling(
     fig, axes = plt.subplots(
         len(comparison_values) + 1,
         len(metric),
-        figsize=(len(metric) * 5, len(getattr(ensemble, comparison)) * 5),
+        figsize=(len(metric) * 5, len(comparison_values) * 5),
     )
 
     # This works better with escaped LaTeX than f-strings. I think.
@@ -101,6 +108,7 @@ def plot_metric_scaling(
 
         for r, v in enumerate(comparison_values):
             # Get the data for this comparison value
+
             data = df.loc[df[comparison] == v]
             sample_values = data[sample_axis].unique()
 

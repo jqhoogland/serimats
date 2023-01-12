@@ -37,7 +37,7 @@ def setup() -> str:
 
 
 T = TypeVar("T")
-OptionalTuple = Union[T, Tuple[T, ...]]
+OptionalTuple = Union[T, Tuple[T, ...], List[T]]
 
 
 def stable_hash(x: Any) -> str:
@@ -45,7 +45,12 @@ def stable_hash(x: Any) -> str:
 
 
 def to_tuple(x: OptionalTuple[T]) -> Tuple[T, ...]:
-    return x if isinstance(x, tuple) else (x,)
+    if isinstance(x, tuple):
+        return x
+    elif isinstance(x, list):
+        return tuple(x)
+
+    return (x,)
 
 
 def get_parameters(model: nn.Module) -> t.Tensor:
@@ -120,6 +125,7 @@ VARS = {
     "seed_weights": r"s_{\mathbf w_0}",
     "seed_perturbation": r"s_{\delta}",
     "perturbation": r"\mathrm{perturbation type}",
+    "n_hidden": r"n^{(l)}_\mathrm{hidden}"
 }
 
 

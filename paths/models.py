@@ -3,7 +3,7 @@ import warnings
 from abc import ABC, abstractmethod
 from collections import OrderedDict
 from pathlib import Path
-from typing import Callable, Optional, Tuple, TypedDict, Union
+from typing import Callable, List, Optional, Tuple, TypedDict, Union
 
 import torch as t
 from torch import nn
@@ -48,7 +48,7 @@ class ExtendedModule(nn.Module):
 
     @staticmethod
     def _init_weights(module):
-        if isinstance(module, nn.Linear):
+        if isinstance(module, (nn.Linear, nn.Conv2d)):
             # Kaiming normal initialization (written by hand so we can constrain the norm of the matrix)
             fan_in, fan_out = nn.init._calculate_fan_in_and_fan_out(module.weight)
             n_params = fan_in * fan_out
@@ -79,37 +79,56 @@ class ExtendedModule(nn.Module):
         return OrderedDict((name, p.shape) for name, p in self.state_dict().items())
 
 
-class MNISTHyperparams(TypedDict):
-    n_hidden: Union[int, Tuple[int, ...]]
-
-
 class MNIST(ExtendedModule):
     """A simple MNIST classifier with a variable number of hidden layers."""
 
-    n_hidden: Union[int, str]
+    n_hidden: Tuple[int, ...]
+    n_units: Tuple[int, ...]
 
-    def __init__(self, hyperparams: Optional[MNISTHyperparams] = None, **kwargs):
+    def __init__(self, n_hidden: Union[int, Tuple[int]], **kwargs):
+        if isinstance(n_hidden, int):
+            n_hidden = (n_hidden,)
+
+        hyperparams = {"n_hidden": n_hidden}
+
         super().__init__(hyperparams=hyperparams, **kwargs)  # type: ignore
 
-        self.n_hidden = n_hidden = self.hyperparams.get("n_hidden", 100)
-
-        if isinstance(n_hidden, int):
-            n_hidden = (784, n_hidden, 10)
-        else:
-            n_hidden = (784, *n_hidden, 10)
-
-            # self.n_hidden = str(n_hidden)
-            # self.hyperparams["n_hidden"] = self.n_hidden
+        self.n_hidden = n_hidden
+        self.n_units = n_units = (784, *n_hidden, 10)
 
         fc_layers = [
-            nn.Linear(n_hidden[i], n_hidden[i + 1]) for i in range(len(n_hidden) - 1)
+            nn.Linear(n_units[i], n_units[i + 1]) for i in range(len(n_units) - 1)
         ]
-        activations = [nn.ReLU() for _ in range(len(n_hidden) - 1)]
+        activations = [nn.ReLU() for _ in range(len(n_units) - 1)]
         hidden_layers = [item for pair in zip(fc_layers, activations) for item in pair]
 
         self.model = nn.Sequential(
             nn.Flatten(),
             *hidden_layers[:-1],  # Skip the last ReLU
+            nn.LogSoftmax(dim=1),
+        )
+
+    def forward(self, x: t.Tensor) -> t.Tensor:
+        return self.model(x)
+
+
+class Lenet5(ExtendedModule):
+    def __init__(self, **kwargs):
+        super().__init__(hyperparams={}, **kwargs)  # type: ignore
+
+        self.model = nn.Sequential(
+            nn.Conv2d(1, 6, 5, padding=2),
+            nn.ReLU(),
+            nn.MaxPool2d(2, 2),
+            nn.Conv2d(6, 16, 5),
+            nn.ReLU(),
+            nn.MaxPool2d(2, 2),
+            nn.Flatten(),
+            nn.Linear(16 * 5 * 5, 120),
+            nn.ReLU(),
+            nn.Linear(120, 84),
+            nn.ReLU(),
+            nn.Linear(84, 10),
             nn.LogSoftmax(dim=1),
         )
 
