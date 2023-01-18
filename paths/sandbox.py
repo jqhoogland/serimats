@@ -30,7 +30,7 @@ from torch.utils.data import DataLoader
 from torchvision import datasets, transforms
 from tqdm.notebook import tqdm
 
-from serimats.paths.models import MNIST
+from serimats.paths.models import FCN
 from serimats.paths.trainer import EnsembleLearner, Experiment
 from serimats.paths.utils import (
     Logger,
@@ -50,7 +50,7 @@ from serimats.paths.weights import (
 device = setup()
 
 train_loader = DataLoader(
-    datasets.MNIST(
+    datasets.FCN(
         "../data",
         train=True,
         download=True,
@@ -62,7 +62,7 @@ train_loader = DataLoader(
     shuffle=True,
 )
 test_loader = DataLoader(
-    datasets.MNIST(
+    datasets.FCN(
         "../data",
         train=False,
         transform=transforms.Compose(
@@ -80,7 +80,7 @@ def run(
     plotter,
     logger,
     logging_ivl=100,
-    model_cls=MNIST,
+    model_cls=FCN,
     opt_cls=optim.SGD,
     **kwargs,
 ):
@@ -135,6 +135,7 @@ MOMENTUM = 0.0
 LR = 0.01
 WEIGHT_DECAY = 0.0
 
+
 def get_opt_hyperparams(lr=LR, momentum=MOMENTUM, weight_decay=WEIGHT_DECAY):
     if isinstance(lr, (tuple, list)):
         return [get_opt_hyperparams(lr=lr_) for lr_ in lr]
@@ -144,6 +145,7 @@ def get_opt_hyperparams(lr=LR, momentum=MOMENTUM, weight_decay=WEIGHT_DECAY):
         return [get_opt_hyperparams(weight_decay=wd_) for wd_ in weight_decay]
 
     return {"lr": lr, "momentum": momentum, "weight_decay": weight_decay}
+
 
 MODEL_HYPERPARAMS = {"n_hidden": 100}
 

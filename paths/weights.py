@@ -1,16 +1,8 @@
 import warnings
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import (
-    Callable,
-    Collection,
-    Container,
-    Iterable,
-    List,
-    Optional,
-    Sequence,
-    Type,
-)
+from typing import (Callable, Collection, Container, Iterable, List, Optional,
+                    Sequence, Tuple, Type)
 
 import matplotlib as mpl
 import matplotlib.pyplot as plt
@@ -23,14 +15,15 @@ import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader
 from torchvision import datasets, transforms
-from tqdm import tqdm
+from tqdm.notebook import tqdm
 
 from serimats.paths.models import ExtendedModule
 
 
 class WeightInitializer(ABC):  # TODO: Nake Generic
     """A class that, when called, jointly initializes a sequence of models"""
-    initial_weights: Optional[t.Tensor]
+
+    initial_weights: Optional[Tuple[t.Tensor]]
 
     @abstractmethod
     def __call__(self, *models: nn.Module):
@@ -52,11 +45,12 @@ class PerturbationInitializer(WeightInitializer, ABC):
     still follow the same distribution as the weights before the perturbation.
 
     """
+
     seed_weights: int
     seed_perturbation: int
     epsilon: float = 0.0
     norm: Callable = t.norm
-    initial_weights: Optional[t.Tensor] = None
+    initial_weights: Optional[Tuple[t.Tensor]] = None
 
     def initialize_weights(self, model: ExtendedModule):
         t.manual_seed(self.seed_weights)
@@ -69,7 +63,7 @@ class PerturbationInitializer(WeightInitializer, ABC):
     def __call__(self, model: ExtendedModule):
         self.initialize_weights(model)
         self.apply_perturbation(model)
-        self.initial_weights = model.parameters_vector
+        self.initial_weights = tuple(p.detach().clone() for p in model.parameters())
 
     @property
     @abstractmethod
@@ -227,7 +221,7 @@ class RelativePerturbationInitializer(PerturbationInitializer):
             t.manual_seed(self.seed_perturbation)
             epsilon = self.epsilon
 
-            self.init_norm = self.norm(model.parameters_vector)
+            self.init_norm = model.norm().item()
             self.delta_norm = self.epsilon * self.init_norm
 
             if self.epsilon == 0.0:
@@ -252,10 +246,10 @@ class RelativePerturbationInitializer(PerturbationInitializer):
 
 
 def test_seed_weights():
-    from serimats.paths.models import MNIST
+    from serimats.paths.models import FCN
 
-    m0 = MNIST(dict(n_hidden=1000))
-    m1 = MNIST(dict(n_hidden=1000))
+    m0 = FCN(dict(n_hidden=1000))
+    m1 = FCN(dict(n_hidden=1000))
 
     perturbation = RelativePerturbationInitializer(
         seed_weights=0,
@@ -271,10 +265,10 @@ def test_seed_weights():
 
 
 def test_seed_perturbation():
-    from serimats.paths.models import MNIST
+    from serimats.paths.models import FCN
 
-    m0 = MNIST(dict(n_hidden=1000))
-    m1 = MNIST(dict(n_hidden=1000))
+    m0 = FCN(dict(n_hidden=1000))
+    m1 = FCN(dict(n_hidden=1000))
 
     perturbation = RelativePerturbationInitializer(
         seed_weights=0,
@@ -290,11 +284,11 @@ def test_seed_perturbation():
 
 
 def test_relative_perturbation():
-    from serimats.paths.models import MNIST
+    from serimats.paths.models import FCN
 
     for epsilon in [0.0, 0.001, 0.01, 0.1, 0.5, 0.9, 1.0, 1.5, 2.0]:
-        m0 = MNIST(dict(n_hidden=1000))
-        ms = [MNIST(dict(n_hidden=1000)) for _ in range(10)]
+        m0 = FCN(dict(n_hidden=1000))
+        ms = [FCN(dict(n_hidden=1000)) for _ in range(10)]
 
         norms = []
         deltas = []
@@ -309,16 +303,18 @@ def test_relative_perturbation():
                 perturbation.initialize_weights(m0)
                 perturbation(m)
 
-                v0 = m.parameters_vector
-                v1 = m0.parameters_vector
+                m_norm = m.norm()
+                m0_norm = m0.norm().item()
 
-                norms.append(v1.norm().item())
-                deltas.append(((v0 - v1).norm() / v0.norm()).item())
+                distance = m.lp_distance(m0).item()
 
-                assert t.allclose(v0.norm(), v1.norm(), atol=1e-2, rtol=1e-2)
-                assert t.allclose(
-                    (v0 - v1).norm(),
-                    (perturbation.epsilon * v0.norm()),
+                norms.append(m0_norm)
+                deltas.append(distance / m_norm)
+
+                assert np.allclose(m_norm, m0_norm, atol=1e-2, rtol=1e-2)
+                assert np.allclose(
+                    distance,
+                    (perturbation.epsilon * m0_norm),
                     atol=1e-2,
                     rtol=1e-2,
                 )

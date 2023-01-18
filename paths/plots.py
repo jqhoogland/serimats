@@ -6,9 +6,23 @@ from dataclasses import dataclass, field
 from os import PathLike
 from pathlib import Path
 from pprint import pp
-from typing import (TYPE_CHECKING, Any, Callable, Dict, Generator, Iterable,
-                    List, Literal, Optional, Protocol, Tuple, Type, TypedDict,
-                    TypeVar, Union)
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Dict,
+    Generator,
+    Iterable,
+    List,
+    Literal,
+    Optional,
+    Protocol,
+    Tuple,
+    Type,
+    TypedDict,
+    TypeVar,
+    Union,
+)
 
 import numpy as np
 import pandas as pd
@@ -20,34 +34,40 @@ from torch import nn, optim
 from torch.nn import functional as F
 from torch.utils.data import DataLoader
 from torchvision import datasets, transforms
-from tqdm import tqdm
+from tqdm.notebook import tqdm
 
-from serimats.paths.metrics import (Metrics, cos_sim_from_baseline,
-                                    cos_sim_from_init, d_w_from_baseline,
-                                    d_w_from_baseline_normed, d_w_from_init,
-                                    d_w_from_init_normed, w_autocorr,
-                                    w_corr_with_baseline, w_normed)
-from serimats.paths.models import MNIST, ExtendedModule
-from serimats.paths.utils import (CallableWithLatex, dict_to_latex, setup,
-                                  var_to_latex)
-from serimats.paths.weights import (AbsolutePerturbationInitializer,
-                                    RelativePerturbationInitializer)
+from serimats.paths.metrics import (
+    Metrics,
+    cos_sim_from_baseline,
+    cos_sim_from_init,
+    d_w_from_baseline,
+    d_w_from_baseline_normed,
+    d_w_from_init,
+    d_w_from_init_normed,
+    w_autocorr,
+    w_corr_with_baseline,
+    w_normed,
+)
+from serimats.paths.models import FCN, ExtendedModule
+from serimats.paths.utils import CallableWithLatex, dict_to_latex, setup, var_to_latex
+from serimats.paths.weights import (
+    AbsolutePerturbationInitializer,
+    RelativePerturbationInitializer,
+)
 
 if TYPE_CHECKING:
     from serimats.paths.experiment import Ensemble
 
 
-
-
 def plot_metric_scaling(
     ensemble: "Ensemble",
     df: pd.DataFrame,
-    metric: Tuple[CallableWithLatex, ...], 
+    metric: Tuple[CallableWithLatex, ...],
     step: Optional[int] = None,
     comparison: str = "epsilon",
     sample_axis: str = "seed_perturbation",
     include_baseline: bool = True,  # Whether to plot the first value of comparison
-    baseline: dict = {"epsilon": 0.},
+    baseline: dict = {"epsilon": 0.0},
     **kwargs,
 ) -> Tuple[Figure, List[List[plt.Axes]]]:
     if step:
@@ -57,7 +77,7 @@ def plot_metric_scaling(
 
     comparison_label = var_to_latex(comparison)
     comparison_values = df[comparison].unique().tolist()
-   
+
     if not include_baseline:
         comparison_values = comparison_values[1:]
 
@@ -67,7 +87,7 @@ def plot_metric_scaling(
     details = dict_to_latex(kwargs)
 
     averages = df
-    
+
     if not include_baseline:
         for k, v in baseline.items():
             averages = averages.loc[averages[k] != v]

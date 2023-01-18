@@ -55,6 +55,7 @@ def to_tuple(x: OptionalTuple[T]) -> Tuple[T, ...]:
 
 def get_parameters(model: nn.Module) -> t.Tensor:
     """Get a flattened tensor of all parameters in a model."""
+    warnings.warn("parameters_vector is expensive for deep models.", DeprecationWarning)
     return t.cat([p.view(-1) for p in model.parameters()])
 
 
