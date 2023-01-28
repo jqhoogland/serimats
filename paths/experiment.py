@@ -6,22 +6,8 @@ from dataclasses import dataclass, field
 from os import PathLike
 from pathlib import Path
 from pprint import pp
-from typing import (
-    Any,
-    Callable,
-    Dict,
-    Generator,
-    Generic,
-    Iterable,
-    List,
-    Literal,
-    Optional,
-    Tuple,
-    Type,
-    TypedDict,
-    TypeVar,
-    Union,
-)
+from typing import (Any, Callable, Dict, Generator, Generic, Iterable, List,
+                    Literal, Optional, Tuple, Type, TypedDict, TypeVar, Union)
 
 import numpy as np
 import pandas as pd
@@ -33,36 +19,20 @@ from torch import nn, optim
 from torch.nn import functional as F
 from torch.utils.data import DataLoader, Dataset
 from torchvision import datasets, transforms
-from tqdm.notebook import tqdm
 
-from serimats.paths.metrics import (
-    Metrics,
-    cos_sim_from_baseline,
-    cos_sim_from_init,
-    d_w_from_baseline,
-    d_w_from_baseline_normed,
-    d_w_from_init,
-    d_w_from_init_normed,
-    w_autocorr,
-    w_corr_with_baseline,
-    w_normed,
-)
+from serimats.paths.metrics import (Metrics, cos_sim_from_baseline,
+                                    cos_sim_from_init, d_w_from_baseline,
+                                    d_w_from_baseline_normed, d_w_from_init,
+                                    d_w_from_init_normed, w_autocorr,
+                                    w_corr_with_baseline, w_normed)
 from serimats.paths.models import FCN, ExtendedModule, Lenet5, ResNet
 from serimats.paths.plots import plot_metric_scaling
-from serimats.paths.utils import (
-    CallableWithLatex,
-    OptionalTuple,
-    dict_to_latex,
-    setup,
-    stable_hash,
-    to_tuple,
-    var_to_latex,
-)
-from serimats.paths.weights import (
-    AbsolutePerturbationInitializer,
-    RelativePerturbationInitializer,
-    WeightInitializer,
-)
+from serimats.paths.utils import (CallableWithLatex, OptionalTuple,
+                                  dict_to_latex, setup, stable_hash, to_tuple,
+                                  tqdm, trange, var_to_latex)
+from serimats.paths.weights import (AbsolutePerturbationInitializer,
+                                    RelativePerturbationInitializer,
+                                    WeightInitializer)
 
 setup()
 
@@ -350,11 +320,13 @@ class Ensemble:
         for learner in self.learners:
             learner.load()
 
-        for epoch in tqdm(range(start_epoch, n_epochs), desc="Training..."):
-            t.manual_seed(self.seed_dl + epoch)  # To shuffle the data
+        for epoch in trange(start_epoch, n_epochs, desc="\tTraining..."):
+            t.manual_seed(self.seed_dl + epoch)  # To shuffle the data                
 
             for batch_idx, batch in tqdm(
-                enumerate(self.train_dl), desc=f"Epoch {epoch}"
+                enumerate(self.train_dl),
+                desc=f"\t\tEpoch {epoch}",
+                total=len(self.train_dl),
             ):
                 step = epoch * len(self.train_dl) + batch_idx
 
@@ -367,7 +339,7 @@ class Ensemble:
                 if step % self.logging_ivl == 0:
                     self.test(step=step, epoch=epoch, batch_idx=batch_idx)
 
-                if step % self.plot_ivl == 0:  # and step > 0:
+                if step % self.plot_ivl == 0 and step > 0:
                     self.plot(step=step)
 
                 if step % self.save_ivl == 0:
@@ -377,7 +349,9 @@ class Ensemble:
         learners = [learner for learner in self.learners if step not in learner.logs]
 
         for metric, learner in tqdm(
-            zip(self.metrics.measure(learners), learners), desc=f"Testing {step}"
+            zip(self.metrics.measure(learners), learners),
+            desc=f"\t\t\tTesting {step}",
+            total=len(learners),
         ):
             learner.log(**metric, **kwargs)
 
@@ -386,7 +360,7 @@ class Ensemble:
         fig_dir = self.dir / "img"
         fig_dir.mkdir(parents=True, exist_ok=True)
 
-        for plot_fn in self.plot_fns:
+        for plot_fn in tqdm(self.plot_fns, "Plotting..."):
             fig, ax = plot_fn(
                 self, df, step=step, baseline=self.baseline, **self.fixed_hyperparams
             )
@@ -398,7 +372,7 @@ class Ensemble:
                 )
 
     def save(self, step: int, overwrite: bool = False):
-        for learner in self.learners:
+        for learner in tqdm(self.learners, "Saving..."):
             learner.save(overwrite=overwrite)
 
     def load(self, *args, **kwargs):
@@ -447,10 +421,10 @@ class Ensemble:
 
 
 def get_mnist_data():
-    train_ds = datasets.FCN(
+    train_ds = datasets.MNIST(
         root="data", train=True, download=True, transform=transforms.ToTensor()
     )
-    test_ds = datasets.FCN(
+    test_ds = datasets.MNIST(
         root="data", train=False, download=True, transform=transforms.ToTensor()
     )
 
@@ -681,7 +655,7 @@ def gen_default_weight_initializer_hyperparams(n_perturbed=10, epsilon=0.01):
     ]
 
 
-def gen_epsilon_range(n_samples: int = 10):
+def gen_epsilon_range(n_samples: int = 10, epsilons=(0.001, 0.01, 0.1, 1.0)):
     return [
         {
             **DEFAULT_WEIGHT_INITIALIZER_HYPERPARAMS,
@@ -696,24 +670,19 @@ def gen_epsilon_range(n_samples: int = 10):
             "seed_perturbation": seed,
             "seed_weights": 1,
         }
-        for epsilon in (0.001, 0.01, 0.1, 1.0)
+        for epsilon in epsilons
         for seed in range(n_samples)
     ]
 
 
 experiments = [
     {
-        "weight_initializer_hyperparams": [
-            {
-                **DEFAULT_WEIGHT_INITIALIZER_HYPERPARAMS,
-                "seed_perturbation": seed,
-            }
-            for seed in range(10)
-        ],
+        # 0 Vanilla
+        "weight_initializer_hyperparams": gen_epsilon_range(10),
         "dir": f"vanilla",
     },
     {
-        # Depth
+        # 1 Depth
         "weight_initializer_hyperparams": gen_default_weight_initializer_hyperparams(),
         "model_hyperparams": [
             {"n_hidden": n_hidden} for n_hidden in tuple((50,) * i for i in range(1, 6))
@@ -722,7 +691,7 @@ experiments = [
         "dir": f"depth",
     },
     {
-        # Width
+        # 2 Width
         "weight_initializer_hyperparams": gen_default_weight_initializer_hyperparams(),
         "model_hyperparams": [
             {"n_hidden": n_hidden} for n_hidden in (400, 200, 100, 50, 25)
@@ -731,7 +700,7 @@ experiments = [
         "dir": f"width",
     },
     {
-        # Momentum
+        # 3 Momentum
         "weight_initializer_hyperparams": gen_default_weight_initializer_hyperparams(),
         "opt_hyperparams": [
             {**DEFAULT_SGD_HYPERPARAMS, "momentum": momentum}
@@ -740,13 +709,13 @@ experiments = [
         "comparison": f"momentum",
     },
     {
-        # Weight decay
+        # 4 Weight decay
         "epsilon": (0.0, 0.01),
         "weight_decay": (0.0, 0.001, 0.01, 0.1, 0.5, 0.9),
         "comparison": "weight_decay",
     },
     {
-        # Learning rate (TODO: compare over normalized time)
+        # 5 Learning rate (TODO: compare over normalized time)
         "weight_initializer_hyperparams": gen_default_weight_initializer_hyperparams(),
         "opt_hyperparams": [
             {**DEFAULT_SGD_HYPERPARAMS, "lr": lr} for lr in (0.1, 0.01, 0.001, 0.0001)
@@ -754,7 +723,7 @@ experiments = [
         "comparison": "lr",
     },
     {
-        # Optimizer
+        # 6 Optimizer
         "model_hyperparams": {
             "cls": FCN,
             "n_hidden": 100,
@@ -767,10 +736,10 @@ experiments = [
             "weight_decay": 0,
         },
         "weight_initializer_hyperparams": gen_epsilon_range(),
-        "dir": "adam",
+        "dir": "adam/2",
     },
     {
-        # Convnets
+        # 7 Convnets
         "model_hyperparams": {
             "cls": Lenet5,
         },
@@ -778,7 +747,7 @@ experiments = [
         "dir": f"lenet5/1",
     },
     {
-        # Other datasets
+        # 8 Other datasets
         "dataset": "cifar10",
         "opt_hyperparams": {
             "cls": t.optim.Adam,
@@ -791,18 +760,30 @@ experiments = [
         "weight_initializer_hyperparams": gen_epsilon_range(5),
         "dir": f"resnet/1",
     },
+    {
+        # 0 More Vanilla
+        "weight_initializer_hyperparams": gen_epsilon_range(5, epsilons=(1.,)),
+        "opt_hyperparams": { 
+            **DEFAULT_SGD_HYPERPARAMS,
+            "lr": 0.1,
+        },
+        "dir": f"vanilla-long",
+    },
 ]
 
 if __name__ == "__main__":
+    experiments = [experiments[-1]]
+
     for ensemble in tqdm(
         make_ensembles(
-            [experiments[-1]],
-            logging_ivl=100,
+            experiments,
+            logging_ivl=1000,
             plot_ivl=2000,
             save_ivl=1000,
         ),
-        desc="",
+        desc="Running experiments...",
+        total=len(experiments),
     ):
-        ensemble.train(n_epochs=10)
+        ensemble.train(n_epochs=200)
 
 # %%

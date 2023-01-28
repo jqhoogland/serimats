@@ -1,8 +1,17 @@
 import warnings
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import (Callable, Collection, Container, Iterable, List, Optional,
-                    Sequence, Tuple, Type)
+from typing import (
+    Callable,
+    Collection,
+    Container,
+    Iterable,
+    List,
+    Optional,
+    Sequence,
+    Tuple,
+    Type,
+)
 
 import matplotlib as mpl
 import matplotlib.pyplot as plt
@@ -15,9 +24,9 @@ import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader
 from torchvision import datasets, transforms
-from tqdm.notebook import tqdm
 
 from serimats.paths.models import ExtendedModule
+from serimats.paths.utils import tqdm
 
 
 class WeightInitializer(ABC):  # TODO: Nake Generic
@@ -184,7 +193,10 @@ class AbsolutePerturbationInitializer(PerturbationInitializer):
         with t.no_grad():
             t.manual_seed(self.seed_perturbation)
 
-            progress = tqdm(model.parameters(), desc="Perturbing weights")
+            progress = tqdm(
+                model.parameters(),
+                desc="Perturbing weights",
+            )
 
             for p in progress:
                 tqdm.set_description(progress, f"Perturing ({p.shape})")

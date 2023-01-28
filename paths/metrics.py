@@ -8,6 +8,7 @@ import torch as t
 import torch.nn.functional as F
 from torch.utils.data.dataloader import DataLoader
 
+from serimats.paths.models import parameters_norm
 from serimats.paths.utils import add_latex
 
 if TYPE_CHECKING:
@@ -109,7 +110,7 @@ def cos_sim_from_baseline(learner: "Learner") -> t.Tensor:
 
 @add_latex(r"w^{(0)}", r"|\mathbf{w}^{(0)}|")
 def w_init(learner: "Learner") -> t.Tensor:
-    return t.norm(learner.weight_initializer.initial_weights)
+    return parameters_norm(learner.weight_initializer.initial_weights)
 
 
 @add_latex(r"\widetilde{v}", r"v / w^{(0)}")
@@ -137,7 +138,9 @@ def w_autocorr(learner: "Learner") -> t.Tensor:
     Calculate the correlation between the current model and itself (at time 0).
     TODO: This is averaged over the parameters, but it should probably be tracked individually for each parameter.
     """
-    return learner.dot(weight_initializer.initial_weights) / learner.n_parameters
+    return (
+        learner.dot(learner.weight_initializer.initial_weights) / learner.n_parameters
+    )
 
 
 @add_latex(

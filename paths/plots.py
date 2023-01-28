@@ -34,7 +34,6 @@ from torch import nn, optim
 from torch.nn import functional as F
 from torch.utils.data import DataLoader
 from torchvision import datasets, transforms
-from tqdm.notebook import tqdm
 
 from serimats.paths.metrics import (
     Metrics,
@@ -49,7 +48,13 @@ from serimats.paths.metrics import (
     w_normed,
 )
 from serimats.paths.models import FCN, ExtendedModule
-from serimats.paths.utils import CallableWithLatex, dict_to_latex, setup, var_to_latex
+from serimats.paths.utils import (
+    CallableWithLatex,
+    dict_to_latex,
+    setup,
+    tqdm,
+    var_to_latex,
+)
 from serimats.paths.weights import (
     AbsolutePerturbationInitializer,
     RelativePerturbationInitializer,
@@ -92,7 +97,7 @@ def plot_metric_scaling(
         for k, v in baseline.items():
             averages = averages.loc[averages[k] != v]
 
-    averages = averages.groupby([comparison, "step"]).mean()
+    averages = averages.groupby([comparison, "step"]).mean(numeric_only=True)
     averages.reset_index(inplace=True)
 
     steps = df["step"].unique()

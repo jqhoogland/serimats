@@ -43,7 +43,7 @@ def dot_parameters(
         if p0.shape != p1.shape:
             raise ValueError("Parameters have different shapes")
 
-        value += p0 @ p1
+        value += t.sum(p0 * p1)
 
     return value
 
@@ -85,15 +85,15 @@ def extract_parameters(
 ) -> Iterable[ParameterOrTensor]:
     """Extract the parameters of a model, weight initalizier, etc."""
     if hasattr(model, "model"):  # Learner
-        model = model.model  # type: ignore
-    if isinstance(model, ExtendedModule):
-        return model.parameters()
-    elif isinstance(model, WeightInitializer):
-        if model.initial_weights is None:
+        return model.model.parameters()  # type: ignore
+    elif hasattr(model, "initial_weights"):  # WeightInitializer
+        if model.initial_weights is None:  # type: ignore
             raise ValueError("Model has not been initialized")
-        return model.initial_weights
+        return model.initial_weights  # type: ignore
+    elif hasattr(model, "parameters"):
+        return model.parameters()  # type: ignore
 
-    return model
+    return model  # type: ignore
 
 
 ParameterExtractable = Union[
@@ -152,6 +152,7 @@ class ExtendedModule(nn.Module):
     def norm(self) -> t.Tensor:
         return parameters_norm(self.parameters())
 
+    @wrap_extractor
     def cosine_similarity(self, other: Iterable[ParameterOrTensor]) -> t.Tensor:
         return cosine_similarity_bw_parameters(self.parameters(), other)
 
@@ -255,15 +256,15 @@ class ResNet(ExtendedModule):
         super().__init__(hyperparams={"n_layers": n_layers}, **kwargs)
 
         if n_layers == 18:
-            self.model = resnet18(pretrained=False)
+            self.model = resnet18(weights=None)
         elif n_layers == 34:
-            self.model = resnet34(pretained=False)
+            self.model = resnet34(weights=None)
         elif n_layers == 50:
-            self.model = resnet50(pretrained=False)
+            self.model = resnet50(weights=None)
         elif n_layers == 101:
-            self.model = resnet101(pretrained=False)
+            self.model = resnet101(weights=None)
         elif n_layers == 152:
-            self.model = resnet152(pretrained=False)
+            self.model = resnet152(weights=None)
 
     def forward(self, x: t.Tensor) -> t.Tensor:
         return self.model(x)

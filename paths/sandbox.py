@@ -28,7 +28,6 @@ import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader
 from torchvision import datasets, transforms
-from tqdm.notebook import tqdm
 
 from serimats.paths.models import FCN
 from serimats.paths.trainer import EnsembleLearner, Experiment
@@ -39,6 +38,7 @@ from serimats.paths.utils import (
     dict_to_latex,
     divide_params,
     setup,
+    tqdm,
     var_to_latex,
 )
 from serimats.paths.weights import (

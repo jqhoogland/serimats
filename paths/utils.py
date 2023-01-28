@@ -3,9 +3,23 @@ import warnings
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import (Any, Callable, Collection, Container, Dict, Generic,
-                    Iterable, List, Optional, Protocol, Sequence, Tuple, Type,
-                    TypeVar, Union)
+from typing import (
+    Any,
+    Callable,
+    Collection,
+    Container,
+    Dict,
+    Generic,
+    Iterable,
+    List,
+    Optional,
+    Protocol,
+    Sequence,
+    Tuple,
+    Type,
+    TypeVar,
+    Union,
+)
 
 import matplotlib as mpl
 import matplotlib.pyplot as plt
@@ -18,6 +32,10 @@ import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader
 from torchvision import datasets, transforms
+
+# Reexport
+# from tqdm import tqdm, trange
+from tqdm.notebook import tqdm, trange
 
 
 def setup() -> str:
@@ -60,12 +78,13 @@ def get_parameters(model: nn.Module) -> t.Tensor:
 
 
 def tensor_map(f: Callable[..., float], *args):
-    """Map a function that returns a float over a (collection of) iterables, 
+    """Map a function that returns a float over a (collection of) iterables,
     then wrap the result in a tensor."""
     return t.tensor([f(*arg) for arg in zip(*args)])
- 
+
 
 # Latex & typesetting
+
 
 class WithLatex(Protocol):
     __latex__: Tuple[str, str]
@@ -73,14 +92,14 @@ class WithLatex(Protocol):
 
 class CallableWithLatex(WithLatex, Protocol):
     __name__: str
-    
+
     def __call__(self, *args, **kwargs) -> Any:
         ...
 
 
 def add_latex(name: str, body: str):
     """Add a latex representation to a function (of the function name & body)."""
-    
+
     def decorator(f) -> CallableWithLatex:
         f.__latex__ = (name, body)
 
@@ -126,7 +145,7 @@ VARS = {
     "seed_weights": r"s_{\mathbf w_0}",
     "seed_perturbation": r"s_{\delta}",
     "perturbation": r"\mathrm{perturbation type}",
-    "n_hidden": r"n^{(l)}_\mathrm{hidden}"
+    "n_hidden": r"n^{(l)}_\mathrm{hidden}",
 }
 
 
