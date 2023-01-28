@@ -5,7 +5,7 @@ Some personal tools for running ML experiments:
 - Run variations of anything and everything (weight initializations, architecture, hyperpararmeters, optimizer choices, etc.).
 - Fine-grained interventions (perturb the weights, gradients, activations, hyperparameters, etc.).
 - Take checkpoints any time.
-- Custom loggers and plotters (record any metric you can imagine — on the models themselves, the test sets, training sets, etc.).
+- Custom loggers and plotters (record any metric you can imagine — on the models themselves, between models, the test sets, training sets, etc.).
 - Train in parallel on a cluster (ok, not yet, but, you know, eventually) or in serial on your local machine. 
 - Reuse past results when running a new intervention if you've already tested a particular condition/control.
 - Consistent seed management. 
@@ -37,11 +37,6 @@ exp = Experiment(
     dataset=dataset,
     interventions=[
         PerturbWeights.make_variations(
-            epsilon=0,  
-            seed=0,
-            control=True
-        ),
-        PerturbWeights.make_variations(
             epsilon=(0.001, 0.01, 0.1),  
             seed=range(10)
         )
@@ -49,7 +44,8 @@ exp = Experiment(
 )
 exp.run()
 
-# This will generate 3 x 10 = 30 learners, each with different perturbaton size or perturbation seed.
+# This will generate 3 x 10 + 1 = 31 learners, each with different perturbaton size or perturbation seed.
+# The extra +1 comes from the control condition, which receives no perturbation.
 ```
 
 Or maybe I want to compare the behavior of different optimizers.
@@ -62,19 +58,30 @@ dataset = datasets.MNIST('data', train=True, download=True,transform=transforms.
 exp = Experiment(
     model=Lenet5(),
     dataset=dataset,
+    control=[
+       InitWeightsIntervention.make_variations(
+            seed=range(10)
+        ),
+        OptimizerIntervention.make_variations(
+            optimizers=torch.optim.SGD,
+            lr=(0.001, 0.01, 0.1),
+        )
+    ],
     interventions=[
         InitWeightsIntervention.make_variations(
             seed=range(10)
         ),
         OptimizerIntervention.make_variations(
-            optimizers=(torch.optim.SGD, torch.optim.Adam),
+            optimizers=torch.optim.Adam,
             lr=(0.001, 0.01, 0.1),
         )
     ],
 )
 
-# This will generate 10 x 2 x 3 = 60 learners, with different initial weights, optimizer, or learning rate.
+# This will generate 10 x 3 x 2 = 60 learners, with different initial weights, optimizer, or learning rate.
 ```
+
+Here, I've included an explicit set of control models so that if I were to include custom metrics, I could measure Adam's performance relative to SGD for the same choice of learning rate.
 
 Or maybe I want to test the effect of a temporary perturbation to momentum, depending on when it is applied during training.
 
@@ -104,7 +111,7 @@ That's a *lot* of variations. My computer will take several days to run all of t
 So I can get rid of the `InitWeightsIntervention`, which leaves me with a more reasonable 54 trials. 
 After I've validated for a fixed choice of weight initialization, I can add it back in, and run the experiment again. Best of all, it'll automatically skip the trials that have already been run.
 
-This allows for a more iterative experimentation loop so you can explore more faster.
+This allows for a more iterative experimentation loop so you can explore more ground faster.
 
 ## Logging and Plotting
 
@@ -126,3 +133,5 @@ class CustomLogger(Logger):
         return torch.dist(learner.model.fc1.weight, learner.model.fc2.weight)
 
 ```
+
+Often, you'll want to compute performance relative to some control condition (e.g., cross entropy relative to an unperturbed model). 
