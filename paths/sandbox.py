@@ -1,44 +1,62 @@
 # %%
-
-from abc import ABC, abstractmethod
+import itertools
+import logging
+import os
 from dataclasses import dataclass, field
+from os import PathLike
 from pathlib import Path
+from pprint import pp
 from typing import (
     Any,
-    Collection,
-    Container,
+    Callable,
+    Dict,
     Generator,
+    Generic,
     Iterable,
-    Iterator,
+    List,
+    Literal,
     Optional,
-    Sequence,
     Tuple,
     Type,
+    TypedDict,
+    TypeVar,
     Union,
 )
 
-import matplotlib as mpl
-import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-import scipy
 import torch as t
-import torch.nn as nn
-import torch.nn.functional as F
-import torch.optim as optim
-from torch.utils.data import DataLoader
+import yaml
+from matplotlib import pyplot as plt
+from matplotlib.figure import Figure
+from torch import nn, optim
+from torch.nn import functional as F
+from torch.utils.data import DataLoader, Dataset
 from torchvision import datasets, transforms
 
-from serimats.paths.models import FCN
-from serimats.paths.trainer import EnsembleLearner, Experiment
+from serimats.paths.metrics import (
+    Metrics,
+    cos_sim_from_baseline,
+    cos_sim_from_init,
+    d_w_from_baseline,
+    d_w_from_baseline_normed,
+    d_w_from_init,
+    d_w_from_init_normed,
+    w_autocorr,
+    w_corr_with_baseline,
+    w_normed,
+)
+from serimats.paths.models import FCN, ExtendedModule, Lenet5, ResNet
+from serimats.paths.plots import plot_metric_scaling
 from serimats.paths.utils import (
-    Logger,
-    Plotter,
-    Snapshotter,
+    CallableWithLatex,
+    OptionalTuple,
     dict_to_latex,
-    divide_params,
     setup,
+    stable_hash,
+    to_tuple,
     tqdm,
+    trange,
     var_to_latex,
 )
 from serimats.paths.weights import (
@@ -49,229 +67,384 @@ from serimats.paths.weights import (
 
 device = setup()
 
-train_loader = DataLoader(
-    datasets.FCN(
-        "../data",
-        train=True,
-        download=True,
-        transform=transforms.Compose(
-            [transforms.ToTensor(), transforms.Normalize((0.1307,), (0.3081,))]
-        ),
-    ),
+
+def get_mnist_data():
+    train_ds = datasets.MNIST(
+        root="data", train=True, download=True, transform=transforms.ToTensor()
+    )
+    test_ds = datasets.MNIST(
+        root="data", train=False, download=True, transform=transforms.ToTensor()
+    )
+
+    return train_ds, test_ds
+
+
+def get_cifar10_data():
+    train_ds = datasets.CIFAR10(
+        root="data", train=True, download=True, transform=transforms.ToTensor()
+    )
+    test_ds = datasets.CIFAR10(
+        root="data", train=False, download=True, transform=transforms.ToTensor()
+    )
+
+    return train_ds, test_ds
+
+
+def get_imagenet_data():
+    train_ds = datasets.ImageFolder(
+        root="data/imagenet/train", transform=transforms.ToTensor()
+    )
+    test_ds = datasets.ImageFolder(
+        root="data/imagenet/val", transform=transforms.ToTensor()
+    )
+
+    return train_ds, test_ds
+
+
+def get_data(dataset: str):
+    if dataset == "mnist":
+        return get_mnist_data()
+    elif dataset == "cifar10":
+        return get_cifar10_data()
+    elif dataset == "imagenet":
+        return get_imagenet_data()
+    else:
+        raise ValueError(f"Unknown dataset {dataset}")
+
+
+DEFAULT_MODEL_HYPERPARAMS = dict(
+    cls=FCN,
+    n_hidden=100,
+)
+
+DEFAULT_SGD_HYPERPARAMS = dict(
+    cls=t.optim.SGD,
+    lr=0.01,
+    momentum=0.0,
+    weight_decay=0.0,
+)
+
+DEFAULT_WEIGHT_INITIALIZER_HYPERPARAMS = dict(
+    cls=RelativePerturbationInitializer,
+    epsilon=0.01,
+    seed_weights=0,
+    seed_perturbation=0,
+)
+
+
+def make_ensembles(
+    experiments: List[Dict[str, Any]],
+    dir: str = "results",
     batch_size=64,
-    shuffle=True,
-)
-test_loader = DataLoader(
-    datasets.FCN(
-        "../data",
-        train=False,
-        transform=transforms.Compose(
-            [transforms.ToTensor(), transforms.Normalize((0.1307,), (0.3081,))]
-        ),
-    ),
-    shuffle=True,
-)
-
-
-def run(
-    train_loader,
-    test_loader,
-    snapshotter,
-    plotter,
-    logger,
     logging_ivl=100,
-    model_cls=FCN,
-    opt_cls=optim.SGD,
-    **kwargs,
+    plot_ivl=2000,
+    save_ivl=1000,
+    seed_dl=0,
+    # dl_hyperparams=DEFAULT_DL_HYPERPARAMS,
+    model_hyperparams=DEFAULT_MODEL_HYPERPARAMS,
+    opt_hyperparams=DEFAULT_SGD_HYPERPARAMS,
+    weight_initializer_hyperparams=DEFAULT_WEIGHT_INITIALIZER_HYPERPARAMS,
+    baseline={"epsilon": 0.0, "seed_perturbation": 0},
 ):
-    # Recursive call for any parameters which are provided as sequences
-    for k, v in kwargs.items():
-        if isinstance(v, (tuple, list)):
-            for subvalue in tqdm(v, desc=f"Iterating over {k}={v}"):
-                run(
-                    train_loader,
-                    test_loader,
-                    snapshotter,
-                    plotter,
-                    logger,
-                    logging_ivl=logging_ivl,
-                    model_cls=model_cls,
-                    opt_cls=opt_cls,
-                    **{**kwargs, k: subvalue},
-                )
+    for experiment in experiments:
+        dataset = experiment.pop("dataset", "mnist")
+        train_data, test_data = get_data(dataset)
 
-    ensemble = EnsembleLearner(
-        model_cls,
-        opt_cls,
-        train_loader,
-        test_loader,
-        **kwargs,
-    )
+        comparison = experiment.pop("comparison", "epsilon")
+        experiment["dir"] = os.path.join(
+            dir, dataset, experiment.pop("dir", comparison)
+        )
 
-    experiment = Experiment(
-        ensemble=ensemble,
-        snapshotter=snapshotter,
-        plotter=plotter,
-        logger=logger,
-        logging_ivl=logging_ivl,
-    )
+        def epsilon_scaling(
+            experiment: "Experiment",
+            df: pd.DataFrame,
+            step: Optional[int] = None,
+            **kwargs,
+        ):
+            return plot_metric_scaling(
+                experiment,
+                # df,
+                df.loc[df["epsilon"] > 0.0],
+                step=step,
+                metric=(w_normed, d_w_from_baseline_normed, d_w_from_init_normed),
+                comparison=comparison,
+                sample_axis="seed_perturbation",
+                include_baseline=False,
+                **kwargs,
+            )
 
-    experiment.train(epoch_start=2)
+        def corr_scaling(
+            experiment: "Experiment",
+            df: pd.DataFrame,
+            step: Optional[int] = None,
+            **kwargs,
+        ):
+            return plot_metric_scaling(
+                experiment,
+                # df,
+                df.loc[df["epsilon"] > 0.0],
+                step=step,
+                metric=(w_corr_with_baseline, w_autocorr),
+                comparison=comparison,
+                sample_axis="seed_perturbation",
+                include_baseline=True,
+                **kwargs,
+            )
 
+        def cos_sim_scaling(
+            experiment: "Experiment",
+            df: pd.DataFrame,
+            step: Optional[int] = None,
+            **kwargs,
+        ):
+            return plot_metric_scaling(
+                experiment,
+                # df,
+                df.loc[df["epsilon"] > 0.0],
+                step=step,
+                metric=(cos_sim_from_baseline, cos_sim_from_init),
+                comparison=comparison,
+                sample_axis="seed_perturbation",
+                include_baseline=True,
+                **kwargs,
+            )
 
-# DIR_PATH = Path("/content/drive/My Drive/AI/SERIMATS/Path Dependence")
-DIR_PATH = Path("..")
-SNAPSHOTS_PATH = DIR_PATH / "snapshots"
-LOGS_PATH = DIR_PATH / "logs"
+        def _loss_scaling(
+            experiment: "Experiment",
+            df: pd.DataFrame,
+            metrics: List[Tuple[str, str]],
+            step: Optional[int] = None,
+            **kwargs,
+        ):
+            def mock_metric(name, latex_name, latex_body=None) -> CallableWithLatex:
+                def metric(*args, **kwargs):
+                    pass
 
-N_EPOCHS = 25
-N_MODELS = 10
-LOGGING_IVL = 100
+                metric.__name__ = name
+                metric.__latex__ = (latex_name, latex_body or latex_name)
 
-# Variable
-SEED = 0
-EPSILON = 0.01
-MOMENTUM = 0.0
-LR = 0.01
-WEIGHT_DECAY = 0.0
+                return metric  # type: ignore
 
+            metric = tuple(mock_metric(*m) for m in metrics)
 
-def get_opt_hyperparams(lr=LR, momentum=MOMENTUM, weight_decay=WEIGHT_DECAY):
-    if isinstance(lr, (tuple, list)):
-        return [get_opt_hyperparams(lr=lr_) for lr_ in lr]
-    if isinstance(momentum, (tuple, list)):
-        return [get_opt_hyperparams(momentum=m_) for m_ in momentum]
-    if isinstance(weight_decay, (tuple, list)):
-        return [get_opt_hyperparams(weight_decay=wd_) for wd_ in weight_decay]
+            return plot_metric_scaling(
+                experiment,
+                # df,
+                df.loc[df["epsilon"] > 0.0],
+                step=step,
+                metric=metric,
+                comparison=comparison,
+                sample_axis="seed_perturbation",
+                include_baseline=True,
+                **kwargs,
+            )
 
-    return {"lr": lr, "momentum": momentum, "weight_decay": weight_decay}
+        def loss_cf_scaling(
+            experiment: "Experiment",
+            df: pd.DataFrame,
+            step: Optional[int] = None,
+            **kwargs,
+        ):
+            return _loss_scaling(
+                experiment,
+                df,
+                step=step,
+                metrics=[
+                    ("L_compare_train", r"L_\mathrm{cf. train}"),
+                    ("L_compare_test", r"L_\mathrm{cf. test}"),
+                    ("acc_compare_train", r"\mathrm{acc}_\mathrm{cf. train}"),
+                    ("acc_compare_test", r"\mathrm{acc}_\mathrm{cf. test}"),
+                ],
+                **kwargs,
+            )
 
+        def loss_true_scaling(
+            experiment: "Experiment",
+            df: pd.DataFrame,
+            step: Optional[int] = None,
+            **kwargs,
+        ):
+            return _loss_scaling(
+                experiment,
+                df,
+                step=step,
+                metrics=[
+                    ("L_train", r"L_\mathrm{train}"),
+                    ("L_test", r"L_\mathrm{test}"),
+                    ("acc_train", r"\mathrm{acc}_\mathrm{train}"),
+                    ("acc_test", r"\mathrm{acc}_\mathrm{test}"),
+                ],
+                **kwargs,
+            )
 
-MODEL_HYPERPARAMS = {"n_hidden": 100}
+        kwargs = {
+            "batch_size": batch_size,
+            "logging_ivl": logging_ivl,
+            "plot_ivl": plot_ivl,
+            "save_ivl": save_ivl,
+            "seed_dl": seed_dl,
+            # "dl_hyperparams": dl_hyperparams,
+            "model_hyperparams": model_hyperparams,
+            "opt_hyperparams": opt_hyperparams,
+            "weight_initializer_hyperparams": weight_initializer_hyperparams,
+            "baseline": baseline,
+            **experiment,
+        }
 
-snapshotter = Snapshotter(SNAPSHOTS_PATH)
-logger = Logger(LOGS_PATH)
-plotter = Plotter()  # TODO Save images as well
+        experiment = Experiment(
+            train_data=train_data,
+            test_data=test_data,
+            **kwargs,
+            plot_fns=(
+                epsilon_scaling,
+                corr_scaling,
+                cos_sim_scaling,
+                loss_cf_scaling,
+                loss_true_scaling,
+            ),
+        )  # type: ignore
 
-# %%
-epsilon_results = run(
-    train_loader,
-    test_loader,
-    snapshotter=snapshotter,
-    plotter=plotter,
-    logger=logger,
-    logging_ivl=LOGGING_IVL,
-    seed=SEED,
-    weight_initializer=[
-        RelativePerturbationInitializer(epsilon=epsilon)
-        for epsilon in [0.001, 0.01, 0.1, 1.0, 10.0]
-    ],
-    n_epochs=N_EPOCHS,
-    n_models=N_MODELS,
-    opt_hyperparams=get_opt_hyperparams(),
-    model_hyperparams=MODEL_HYPERPARAMS,
-)
-
-# %%
-
-lr_experiments = run(
-    train_loader,
-    test_loader,
-    snapshotter=snapshotter,
-    plotter=plotter,
-    logger=logger,
-    epsilon=0.01,
-    lr=[0.001, 0.01, 0.1],
-    seed=0,
-    logging_interval=1000,
-)
-
-# %%
-
-momentum_experiments = run(
-    train_loader,
-    test_loader,
-    snapshotter=snapshotter,
-    plotter=plotter,
-    logger=logger,
-    epsilon=0.01,
-    momentum=[0.001, 0.01, 0.1],
-    seed=0,
-    logging_interval=1000,
-)
-
-# %%
-
-weight_decay_experiments = run(
-    train_loader,
-    test_loader,
-    snapshotter=snapshotter,
-    plotter=plotter,
-    logger=logger,
-    epsilon=0.01,
-    lr=0.01,
-    momentum=0.01,
-    weight_decay=[0.001, 0.01, 0.1],
-    seed=0,
-    logging_interval=1000,
-)
-
-# %%
-
-seed_experiments = run(
-    train_loader,
-    test_loader,
-    snapshotter=snapshotter,
-    plotter=plotter,
-    logger=logger,
-    epsilon=0.01,
-    lr=0.01,
-    momentum=0.01,
-    weight_decay=0.01,
-    seed=[0, 1, 2, 3, 4],
-    logging_interval=1000,
-)
-
-# run(
-#     train_loader,
-#     test_loader,
-#     epsilon=0.01,
-#     lr=0.01,
-#     momentum=0.01,
-#     weight_decay=0.01,
-#     seed=0,
-#     batch_size=[1, 10, 100],
-# )
-
-# %%
-
-width_experiments = run(
-    train_loader,
-    test_loader,
-    snapshotter=snapshotter,
-    plotter=plotter,
-    logger=logger,
-    epsilon=0.01,
-    lr=0.01,
-    momentum=0.01,
-    weight_decay=0.01,
-    seed=0,
-    logging_interval=1000,
-    config=[{"n_hidden": n_h} for n_h in [10, 50, 100, 500, 1000]],
-)
+        yield experiment
 
 
-depth_experiments = run(
-    train_loader,
-    test_loader,
-    snapshotter=snapshotter,
-    plotter=plotter,
-    logger=logger,
-    epsilon=0.01,
-    lr=0.01,
-    momentum=0.01,
-    weight_decay=0.01,
-    seed=0,
-    logging_interval=1000,
-    config=[{"n_hidden": divide_params(50000, i, 784, 10)} for i in range(1, 6)],
-)
+def gen_default_weight_initializer_hyperparams(n_perturbed=10, epsilon=0.01):
+    return [{**DEFAULT_WEIGHT_INITIALIZER_HYPERPARAMS, "epsilon": 0.0}] + [
+        {
+            **DEFAULT_WEIGHT_INITIALIZER_HYPERPARAMS,
+            "epsilon": epsilon,
+            "seed_perturbation": seed,
+        }
+        for seed in range(n_perturbed)
+    ]
+
+
+def gen_epsilon_range(n_samples: int = 10, epsilons=(0.001, 0.01, 0.1, 1.0)):
+    return [
+        {
+            **DEFAULT_WEIGHT_INITIALIZER_HYPERPARAMS,
+            "epsilon": 0,
+            "seed_perturbation": 0,
+            "seed_weights": 1,
+        }
+    ] + [
+        {
+            **DEFAULT_WEIGHT_INITIALIZER_HYPERPARAMS,
+            "epsilon": epsilon,
+            "seed_perturbation": seed,
+            "seed_weights": 1,
+        }
+        for epsilon in epsilons
+        for seed in range(n_samples)
+    ]
+
+
+experiments = [
+    {
+        # 0 Vanilla
+        "weight_initializer_hyperparams": gen_epsilon_range(10),
+        "dir": f"vanilla",
+    },
+    {
+        # 1 Depth
+        "weight_initializer_hyperparams": gen_default_weight_initializer_hyperparams(),
+        "model_hyperparams": [
+            {"n_hidden": n_hidden} for n_hidden in tuple((50,) * i for i in range(1, 6))
+        ],
+        "comparison": f"n_hidden",
+        "dir": f"depth",
+    },
+    {
+        # 2 Width
+        "weight_initializer_hyperparams": gen_default_weight_initializer_hyperparams(),
+        "model_hyperparams": [
+            {"n_hidden": n_hidden} for n_hidden in (400, 200, 100, 50, 25)
+        ],
+        "comparison": f"n_hidden",
+        "dir": f"width",
+    },
+    {
+        # 3 Momentum
+        "weight_initializer_hyperparams": gen_default_weight_initializer_hyperparams(),
+        "opt_hyperparams": [
+            {**DEFAULT_SGD_HYPERPARAMS, "momentum": momentum}
+            for momentum in (0.0, 0.1, 0.5, 0.9)
+        ],
+        "comparison": f"momentum",
+    },
+    {
+        # 4 Weight decay
+        "epsilon": (0.0, 0.01),
+        "weight_decay": (0.0, 0.001, 0.01, 0.1, 0.5, 0.9),
+        "comparison": "weight_decay",
+    },
+    {
+        # 5 Learning rate (TODO: compare over normalized time)
+        "weight_initializer_hyperparams": gen_default_weight_initializer_hyperparams(),
+        "opt_hyperparams": [
+            {**DEFAULT_SGD_HYPERPARAMS, "lr": lr} for lr in (0.1, 0.01, 0.001, 0.0001)
+        ],
+        "comparison": "lr",
+    },
+    {
+        # 6 Optimizer
+        "model_hyperparams": {
+            "cls": FCN,
+            "n_hidden": 100,
+        },
+        "opt_hyperparams": {
+            "cls": t.optim.Adam,
+            "lr": 0.001,
+            "betas": (0.9, 0.999),
+            "eps": 1e-08,
+            "weight_decay": 0,
+        },
+        "weight_initializer_hyperparams": gen_epsilon_range(),
+        "dir": "adam/2",
+    },
+    {
+        # 7 Convnets
+        "model_hyperparams": {
+            "cls": Lenet5,
+        },
+        "weight_initializer_hyperparams": gen_epsilon_range(),
+        "dir": f"lenet5/1",
+    },
+    {
+        # 8 Other datasets
+        "dataset": "cifar10",
+        "opt_hyperparams": {
+            "cls": t.optim.Adam,
+            "lr": 0.001,
+            "betas": (0.9, 0.999),
+            "eps": 1e-08,
+            "weight_decay": 0,
+        },
+        "model_hyperparams": {"cls": ResNet, "n_layers": 18},
+        "weight_initializer_hyperparams": gen_epsilon_range(5),
+        "dir": f"resnet/1",
+    },
+    {
+        # 0 More Vanilla
+        "weight_initializer_hyperparams": gen_epsilon_range(5, epsilons=(1.0,)),
+        "opt_hyperparams": {
+            **DEFAULT_SGD_HYPERPARAMS,
+            "lr": 0.1,
+        },
+        "dir": f"vanilla-long",
+    },
+]
+
+if __name__ == "__main__":
+    experiments = [experiments[-1]]
+
+    for experiment in tqdm(
+        make_ensembles(
+            experiments,
+            logging_ivl=1000,
+            plot_ivl=2000,
+            save_ivl=1000,
+        ),
+        desc="Running experiments...",
+        total=len(experiments),
+    ):
+        experiment.train(n_epochs=200)

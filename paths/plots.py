@@ -61,11 +61,11 @@ from serimats.paths.weights import (
 )
 
 if TYPE_CHECKING:
-    from serimats.paths.experiment import Ensemble
+    from serimats.paths.experiment import Experiment
 
 
 def plot_metric_scaling(
-    ensemble: "Ensemble",
+    experiment: "Experiment",
     df: pd.DataFrame,
     metric: Tuple[CallableWithLatex, ...],
     step: Optional[int] = None,
@@ -178,4 +178,35 @@ def plot_metric_scaling(
     return fig, axes
 
 
-# %%
+class Plotter:
+    def __init__(
+        self,
+        metrics: Optional[Metrics] = None,
+        experiment: Optional["Experiment"] = None,
+        ivl=1000,
+    ):
+        self.metrics = metrics
+        self.experiment = experiment
+        self.ivl = ivl
+
+    def plot(self, epoch_idx: int, batch_idx: int, step: int, overwrite: bool = False):
+        df = self.df()
+        fig_dir = self.dir / "img"
+        fig_dir.mkdir(parents=True, exist_ok=True)
+
+        for plot_fn in tqdm(self.plot_fns, "Plotting..."):
+            fig, ax = plot_fn(
+                self, df, step=step, baseline=self.baseline, **self.fixed_hyperparams
+            )
+
+            # Save the figure
+            if fig is not None or overwrite:
+                fig.savefig(
+                    str(fig_dir / f"{plot_fn.__name__}_{step}.png"),
+                )
+
+    def add_metrics(self, metrics: Metrics):
+        self.metrics = metrics
+
+    def register(self, experiment: "Experiment"):
+        self.experiment = experiment

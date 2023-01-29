@@ -84,7 +84,7 @@ def extract_parameters(
     model: Union["ExtendedModule", Iterable[ParameterOrTensor], "WeightInitializer"]
 ) -> Iterable[ParameterOrTensor]:
     """Extract the parameters of a model, weight initalizier, etc."""
-    if hasattr(model, "model"):  # Learner
+    if hasattr(model, "model"):  # Trial
         return model.model.parameters()  # type: ignore
     elif hasattr(model, "initial_weights"):  # WeightInitializer
         if model.initial_weights is None:  # type: ignore

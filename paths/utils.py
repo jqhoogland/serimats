@@ -55,20 +55,22 @@ def setup() -> str:
 
 
 T = TypeVar("T")
+S = TypeVar("S")
 OptionalTuple = Union[T, Tuple[T, ...], List[T]]
+WithOptions = Union[T, Tuple[T, Dict[str, Any]]]
 
 
 def stable_hash(x: Any) -> str:
     return hashlib.sha256(str(x).encode("utf-8")).hexdigest()[:32]
 
 
-def to_tuple(x: OptionalTuple[T]) -> Tuple[T, ...]:
+def to_tuple(x: OptionalTuple[T], *defaults: Iterable[S]):
     if isinstance(x, tuple):
         return x
     elif isinstance(x, list):
         return tuple(x)
 
-    return (x,)
+    return (x, *defaults)
 
 
 def get_parameters(model: nn.Module) -> t.Tensor:

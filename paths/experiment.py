@@ -1,789 +1,160 @@
-# %%
 import itertools
-import logging
-import os
-from dataclasses import dataclass, field
-from os import PathLike
-from pathlib import Path
-from pprint import pp
-from typing import (Any, Callable, Dict, Generator, Generic, Iterable, List,
-                    Literal, Optional, Tuple, Type, TypedDict, TypeVar, Union)
+from typing import Dict, Iterable, List, Optional, Tuple, Type, TypeVar, Union
 
-import numpy as np
 import pandas as pd
-import torch as t
-import yaml
-from matplotlib import pyplot as plt
-from matplotlib.figure import Figure
-from torch import nn, optim
-from torch.nn import functional as F
+from torch import optim
 from torch.utils.data import DataLoader, Dataset
-from torchvision import datasets, transforms
 
-from serimats.paths.metrics import (Metrics, cos_sim_from_baseline,
-                                    cos_sim_from_init, d_w_from_baseline,
-                                    d_w_from_baseline_normed, d_w_from_init,
-                                    d_w_from_init_normed, w_autocorr,
-                                    w_corr_with_baseline, w_normed)
-from serimats.paths.models import FCN, ExtendedModule, Lenet5, ResNet
-from serimats.paths.plots import plot_metric_scaling
-from serimats.paths.utils import (CallableWithLatex, OptionalTuple,
-                                  dict_to_latex, setup, stable_hash, to_tuple,
-                                  tqdm, trange, var_to_latex)
-from serimats.paths.weights import (AbsolutePerturbationInitializer,
-                                    RelativePerturbationInitializer,
-                                    WeightInitializer)
-
-setup()
-
-
-def get_opt_hyperparams(opt: optim.Optimizer) -> dict:
-    """Assumes that the optimizer has only a single set of hyperparams
-    (and not a separate set for each parameter group)"""
-    param_group = opt.param_groups[0]
-
-    hyperparams = {}
-
-    for k, v in param_group.items():
-        if k not in ["params", "foreach", "maximize", "capturable", "fused"]:
-            hyperparams[k] = v
-
-    return hyperparams
-
-
-class Learner:
-    #: The model we're comparing against (important for certain metrics)
-    baseline: "Learner"
-
-    def __init__(
-        self,
-        model: ExtendedModule,
-        opt: optim.Optimizer,
-        weight_initializer: WeightInitializer,
-        dir: PathLike = Path("results"),
-    ):
-        self.model = model
-        self.opt = opt
-        self.weight_initializer = weight_initializer
-        self.weight_initializer(self.model)
-
-        self.baseline = self
-
-        self.dir = Path(dir)
-        self.logs = {}
-        self.step = 0
-
-    @classmethod
-    def from_hyperparams(
-        cls,
-        model_hyperparams: dict = {},
-        weight_initializer_hyperparams: dict = {},
-        opt_hyperparams: dict = {},
-        **kwargs,
-    ):
-        model_cls = model_hyperparams.pop("cls")
-        opt_cls = opt_hyperparams.pop("cls")
-        weight_initializer_cls = weight_initializer_hyperparams.pop("cls")
-
-        model = model_cls(**model_hyperparams)
-        opt = opt_cls(model.parameters(), **opt_hyperparams)
-        weight_initializer = weight_initializer_cls(**weight_initializer_hyperparams)
-
-        return cls(
-            model=model, opt=opt, weight_initializer=weight_initializer, **kwargs
-        )
-
-    def loss(
-        self, output: t.Tensor, target: t.Tensor, reduction: str = "mean"
-    ) -> t.Tensor:
-        return F.nll_loss(output, target, reduction=reduction)
-
-    def train_batch(
-        self, epoch: int, batch_idx: int, step: int, batch: Tuple[t.Tensor, t.Tensor]
-    ):
-        x, y = batch
-
-        self.opt.zero_grad()
-        output = self.model(x)
-        loss = self.loss(output, y)
-        loss.backward()
-        self.opt.step()
-        self.step = step
-
-        return loss.item()
-
-    def log(self, step: Optional[int] = None, **kwargs):
-        if step is None:
-            step = self.step
-
-        self.logs[step] = self.logs.get(step, {})
-        self.logs[step].update(kwargs)
-
-    def save(self, overwrite: bool = False):
-        self.path.mkdir(parents=True, exist_ok=True)
-        self.path_to_step.mkdir(parents=True, exist_ok=True)
-
-        if not overwrite and (self.path_to_step / "model.pt").exists():
-            # raise FileExistsError(self.path_to_step)
-            logging.info(f"Step {self.step} already exists, skipping")
-            return False
-
-        self.df(full=False).to_csv(self.path / "logs.csv")
-        t.save(self.model.state_dict(), self.path_to_step / "model.pt")
-        t.save(self.opt.state_dict(), self.path_to_step / "opt.pt")
-
-        yaml.dump(self.hyperparams, open(self.path / "hyperparams.yaml", "w"))
-
-        logging.info(
-            f"Saved model to {self.path_to_step} (step={self.step}, {self.extra_repr})"
-        )
-
-        return True
-
-    def load(self, step: Optional[int] = None):
-        try:
-            logs_df = pd.read_csv(self.path / "logs.csv")
-
-            if step is None:
-                self.step = logs_df["step"].max().item()
-            else:
-                self.step = step
-
-            logs_df = logs_df.set_index("step")
-            self.logs = logs_df.to_dict(orient="index")
-
-        except FileNotFoundError:
-            logging.info(f"Could not load logs from {self.path / 'logs.csv'}")
-            logging.info(yaml.dump(self.hyperparams))
-            self.logs = {}
-            return False
-
-        try:
-            self.model.load_state_dict(t.load(self.path_to_step / "model.pt"))
-            self.opt.load_state_dict(t.load(self.path_to_step / "opt.pt"))
-
-            logging.info(
-                f"Loaded model from {self.path_to_step} (step={self.step}, {self.extra_repr})"
-            )
-        except FileNotFoundError:
-            logging.info(f"Could not load model or optimizer from {self.path_to_step}")
-            return False
-
-        return True
-
-    @property
-    def path_to_step(self):
-        return self.path / ("step-" + str(self.step))
-
-    @property
-    def path(self):
-        return self.dir / "runs" / self.name
-
-    @property
-    def name(self):
-        return f"{self.model.__class__.__name__}_{self.hash}"
-
-    @property
-    def hash(self):
-        return stable_hash(self.extra_repr)
-
-    @property
-    def hyperparams(self):
-        hyperparams = {
-            **self.model.hyperparams,
-            **get_opt_hyperparams(self.opt),
-            **self.weight_initializer.hyperparams,
-        }
-
-        # Consistent ordering
-        return {k: hyperparams[k] for k in sorted(hyperparams.keys())}
-
-    @property
-    def extra_repr(self):
-        return ", ".join(f"{k}={v}" for k, v in self.hyperparams.items())
-
-    def df(self, full=True):
-        """DataFrame of logs (add on hyperparams as cols)"""
-        df = pd.DataFrame.from_dict(self.logs, orient="index")
-        # df["step"] = df.index
-        df = df.rename_axis("step").reset_index()
-
-        if full:
-            hyperparams = self.hyperparams.copy()
-
-            for k, v in hyperparams.items():
-                if isinstance(v, (list, tuple)):
-                    hyperparams[k] = [v] * len(df)
-
-            df = df.assign(**hyperparams)
-
-        return df
-
-    @property
-    def device(self):
-        return self.model.device
-
-    def __call__(self, *args, **kwargs) -> t.Tensor:
-        return self.model(*args, **kwargs)
-
-    def __getattribute__(self, __name: str) -> Any:
-        """Forward attributes to model"""
-        try:
-            return super().__getattribute__(__name)
-        except AttributeError:
-            return getattr(self.model, __name)
-
-
-class Ensemble:
-    def __init__(
-        self,
-        train_data: Dataset,
-        test_data: Dataset,
-        seed_dl: int = 0,
-        dir: str = "results",
-        batch_size: int = 64,
-        logging_ivl: int = 100,
-        plot_fns: Optional[
-            OptionalTuple[Callable[..., Tuple[Figure, plt.Axes]]]
-        ] = None,
-        plot_ivl: int = 5000,
-        save_ivl: int = 2000,
-        opt_hyperparams: OptionalTuple[Dict[str, Any]] = {},
-        model_hyperparams: OptionalTuple[Dict[str, Any]] = {},
-        weight_initializer_hyperparams: OptionalTuple[Dict[str, Any]] = {},
-        hyperparams: Optional[List[Tuple[Dict[str, Any], ...]]] = None,
-        baseline: dict = {"epsilon": 0.0, "seed_perturbation": 0},
-    ):
-        self.dir = Path(dir)
-        self.save_ivl = save_ivl
-        self.logging_ivl = logging_ivl
-        self.plot_ivl = plot_ivl
-        self.plot_fns = to_tuple(plot_fns) if plot_fns else []
-
-        self.seed_dl = seed_dl
-        self.train_dl = DataLoader(train_data, batch_size=batch_size, shuffle=True)
-        self.test_dl = DataLoader(test_data, batch_size=batch_size, shuffle=False)
-        self.metrics = Metrics(self.train_dl, self.test_dl)
-
-        # There are two ways to specify hyperparams:
-        # 1. Fully specify a list of hyperparams (tuples of opt, model, weight_initializer hyperparams).
-        #    Then the kwargs (opt_hyperparams, model_hyperparams, weight_initializer_hyperparams) are used as defaults.
-        # 2. Specify a list of hyperparams for each of opt, model, weight_initializer, then take the product
-
-        if hyperparams is not None:
-            assert isinstance(opt_hyperparams, (dict))
-            assert isinstance(model_hyperparams, (dict))
-            assert isinstance(weight_initializer_hyperparams, (dict))
-
-            self.hyperparams = [
-                (
-                    {**opt_hyperparams, **o},
-                    {**model_hyperparams, **m},
-                    {**weight_initializer_hyperparams, **w},
-                )
-                for o, m, w in hyperparams
-            ]
-        else:
-            opt_hyperparams = to_tuple(opt_hyperparams)
-            model_hyperparams = to_tuple(model_hyperparams)
-            weight_initializer_hyperparams = to_tuple(weight_initializer_hyperparams)
-
-            self.hyperparams = [
-                (o.copy(), m.copy(), w.copy())
-                for o, m, w in itertools.product(
-                    model_hyperparams,
-                    opt_hyperparams,
-                    weight_initializer_hyperparams,
-                )
-            ]
-
-        self.learners = [
-            Learner.from_hyperparams(
-                dir=dir,
-                model_hyperparams=model_hyperparams,  # type: ignore
-                opt_hyperparams=opt_hyperparams,  # type: ignore
-                weight_initializer_hyperparams=weight_initializer_hyperparams,  # type: ignore
-            )
-            for model_hyperparams, opt_hyperparams, weight_initializer_hyperparams in self.hyperparams
-        ]
-
-        # Add baselines
-        self.baseline = baseline
-
-        for learner in self.learners:
-            hp = learner.hyperparams.copy()
-            hp.update(self.baseline)
-            learner.baseline = next(self.filter_learners(**hp))
-
-    def train(self, n_epochs: int, start_epoch: int = 0, reset: bool = False):
-        step, batch_idx = 0, 0
-        for learner in self.learners:
-            learner.load()
-
-        for epoch in trange(start_epoch, n_epochs, desc="\tTraining..."):
-            t.manual_seed(self.seed_dl + epoch)  # To shuffle the data                
-
-            for batch_idx, batch in tqdm(
-                enumerate(self.train_dl),
-                desc=f"\t\tEpoch {epoch}",
-                total=len(self.train_dl),
-            ):
-                step = epoch * len(self.train_dl) + batch_idx
-
-                for learner in self.learners:
-                    if learner.step >= step:
-                        continue
-
-                    learner.train_batch(epoch, batch_idx, step, batch)
-
-                if step % self.logging_ivl == 0:
-                    self.test(step=step, epoch=epoch, batch_idx=batch_idx)
-
-                if step % self.plot_ivl == 0 and step > 0:
-                    self.plot(step=step)
-
-                if step % self.save_ivl == 0:
-                    self.save(step=step)
-
-    def test(self, step, **kwargs):
-        learners = [learner for learner in self.learners if step not in learner.logs]
-
-        for metric, learner in tqdm(
-            zip(self.metrics.measure(learners), learners),
-            desc=f"\t\t\tTesting {step}",
-            total=len(learners),
-        ):
-            learner.log(**metric, **kwargs)
-
-    def plot(self, step: Optional[int] = None, overwrite: bool = False):
-        df = self.df()
-        fig_dir = self.dir / "img"
-        fig_dir.mkdir(parents=True, exist_ok=True)
-
-        for plot_fn in tqdm(self.plot_fns, "Plotting..."):
-            fig, ax = plot_fn(
-                self, df, step=step, baseline=self.baseline, **self.fixed_hyperparams
-            )
-
-            # Save the figure
-            if fig is not None or overwrite:
-                fig.savefig(
-                    str(fig_dir / f"{plot_fn.__name__}_{step}.png"),
-                )
-
-    def save(self, step: int, overwrite: bool = False):
-        for learner in tqdm(self.learners, "Saving..."):
-            learner.save(overwrite=overwrite)
-
-    def load(self, *args, **kwargs):
-        for learner in self.learners:
-            learner.load(*args, **kwargs)
-
-    def df(self):
-        """Returns a dataframe with the logs of all learners"""
-        return pd.concat([learner.df() for learner in self.learners])
-
-    @property
-    def models(self):
-        """Returns a list of all models"""
-        return [learner.model for learner in self.learners]
-
-    @property
-    def fixed_hyperparams(self):
-        """Returns a dictionary with the hyperparams that are fixed for all learners"""
-
-        hyperparams = {}
-        variable_hyperparams = set()
-
-        for learner in self.learners:
-            for name, value in learner.hyperparams.items():
-                if name in hyperparams and value != hyperparams[name]:
-                    variable_hyperparams.add(name)
-                    del hyperparams[name]
-                elif name not in hyperparams and name not in variable_hyperparams:
-                    hyperparams[name] = value
-
-        return hyperparams
-
-    def filter_learners(self, **kwargs) -> Generator[Learner, None, None]:
-        """Filter learners by hyperparameters"""
-        return (
-            learner
-            for learner in self.learners
-            if all(learner.hyperparams[k] == v for k, v in kwargs.items())
-        )
-
-    def __getitem__(self, i):
-        return self.learners[i]
-
-    def __len__(self):
-        return len(self.learners)
-
-
-def get_mnist_data():
-    train_ds = datasets.MNIST(
-        root="data", train=True, download=True, transform=transforms.ToTensor()
-    )
-    test_ds = datasets.MNIST(
-        root="data", train=False, download=True, transform=transforms.ToTensor()
-    )
-
-    return train_ds, test_ds
-
-
-def get_cifar10_data():
-    train_ds = datasets.CIFAR10(
-        root="data", train=True, download=True, transform=transforms.ToTensor()
-    )
-    test_ds = datasets.CIFAR10(
-        root="data", train=False, download=True, transform=transforms.ToTensor()
-    )
-
-    return train_ds, test_ds
-
-
-def get_imagenet_data():
-    train_ds = datasets.ImageFolder(
-        root="data/imagenet/train", transform=transforms.ToTensor()
-    )
-    test_ds = datasets.ImageFolder(
-        root="data/imagenet/val", transform=transforms.ToTensor()
-    )
-
-    return train_ds, test_ds
-
-
-def get_data(dataset: str):
-    if dataset == "mnist":
-        return get_mnist_data()
-    elif dataset == "cifar10":
-        return get_cifar10_data()
-    elif dataset == "imagenet":
-        return get_imagenet_data()
-    else:
-        raise ValueError(f"Unknown dataset {dataset}")
-
-
-DEFAULT_MODEL_HYPERPARAMS = dict(
-    cls=FCN,
-    n_hidden=100,
-)
-
-DEFAULT_SGD_HYPERPARAMS = dict(
-    cls=t.optim.SGD,
-    lr=0.01,
-    momentum=0.0,
-    weight_decay=0.0,
-)
-
-DEFAULT_WEIGHT_INITIALIZER_HYPERPARAMS = dict(
-    cls=RelativePerturbationInitializer,
-    epsilon=0.01,
-    seed_weights=0,
-    seed_perturbation=0,
-)
-
-
-def make_ensembles(
-    experiments: List[Dict[str, Any]],
-    dir: str = "results",
-    batch_size=64,
-    logging_ivl=100,
-    plot_ivl=2000,
-    save_ivl=1000,
-    seed_dl=0,
-    # dl_hyperparams=DEFAULT_DL_HYPERPARAMS,
-    model_hyperparams=DEFAULT_MODEL_HYPERPARAMS,
-    opt_hyperparams=DEFAULT_SGD_HYPERPARAMS,
-    weight_initializer_hyperparams=DEFAULT_WEIGHT_INITIALIZER_HYPERPARAMS,
-    baseline={"epsilon": 0.0, "seed_perturbation": 0},
-):
-    for experiment in experiments:
-        dataset = experiment.pop("dataset", "mnist")
-        train_data, test_data = get_data(dataset)
-
-        comparison = experiment.pop("comparison", "epsilon")
-        experiment["dir"] = os.path.join(
-            dir, dataset, experiment.pop("dir", comparison)
-        )
-
-        def epsilon_scaling(
-            ensemble: "Ensemble", df: pd.DataFrame, step: Optional[int] = None, **kwargs
-        ):
-            return plot_metric_scaling(
-                ensemble,
-                # df,
-                df.loc[df["epsilon"] > 0.0],
-                step=step,
-                metric=(w_normed, d_w_from_baseline_normed, d_w_from_init_normed),
-                comparison=comparison,
-                sample_axis="seed_perturbation",
-                include_baseline=False,
-                **kwargs,
-            )
-
-        def corr_scaling(
-            ensemble: "Ensemble", df: pd.DataFrame, step: Optional[int] = None, **kwargs
-        ):
-            return plot_metric_scaling(
-                ensemble,
-                # df,
-                df.loc[df["epsilon"] > 0.0],
-                step=step,
-                metric=(w_corr_with_baseline, w_autocorr),
-                comparison=comparison,
-                sample_axis="seed_perturbation",
-                include_baseline=True,
-                **kwargs,
-            )
-
-        def cos_sim_scaling(
-            ensemble: "Ensemble", df: pd.DataFrame, step: Optional[int] = None, **kwargs
-        ):
-            return plot_metric_scaling(
-                ensemble,
-                # df,
-                df.loc[df["epsilon"] > 0.0],
-                step=step,
-                metric=(cos_sim_from_baseline, cos_sim_from_init),
-                comparison=comparison,
-                sample_axis="seed_perturbation",
-                include_baseline=True,
-                **kwargs,
-            )
-
-        def _loss_scaling(
-            ensemble: "Ensemble",
-            df: pd.DataFrame,
-            metrics: List[Tuple[str, str]],
-            step: Optional[int] = None,
-            **kwargs,
-        ):
-            def mock_metric(name, latex_name, latex_body=None) -> CallableWithLatex:
-                def metric(*args, **kwargs):
-                    pass
-
-                metric.__name__ = name
-                metric.__latex__ = (latex_name, latex_body or latex_name)
-
-                return metric  # type: ignore
-
-            metric = tuple(mock_metric(*m) for m in metrics)
-
-            return plot_metric_scaling(
-                ensemble,
-                # df,
-                df.loc[df["epsilon"] > 0.0],
-                step=step,
-                metric=metric,
-                comparison=comparison,
-                sample_axis="seed_perturbation",
-                include_baseline=True,
-                **kwargs,
-            )
-
-        def loss_cf_scaling(
-            ensemble: "Ensemble", df: pd.DataFrame, step: Optional[int] = None, **kwargs
-        ):
-            return _loss_scaling(
-                ensemble,
-                df,
-                step=step,
-                metrics=[
-                    ("L_compare_train", r"L_\mathrm{cf. train}"),
-                    ("L_compare_test", r"L_\mathrm{cf. test}"),
-                    ("acc_compare_train", r"\mathrm{acc}_\mathrm{cf. train}"),
-                    ("acc_compare_test", r"\mathrm{acc}_\mathrm{cf. test}"),
-                ],
-                **kwargs,
-            )
-
-        def loss_true_scaling(
-            ensemble: "Ensemble", df: pd.DataFrame, step: Optional[int] = None, **kwargs
-        ):
-            return _loss_scaling(
-                ensemble,
-                df,
-                step=step,
-                metrics=[
-                    ("L_train", r"L_\mathrm{train}"),
-                    ("L_test", r"L_\mathrm{test}"),
-                    ("acc_train", r"\mathrm{acc}_\mathrm{train}"),
-                    ("acc_test", r"\mathrm{acc}_\mathrm{test}"),
-                ],
-                **kwargs,
-            )
-
-        kwargs = {
-            "batch_size": batch_size,
-            "logging_ivl": logging_ivl,
-            "plot_ivl": plot_ivl,
-            "save_ivl": save_ivl,
-            "seed_dl": seed_dl,
-            # "dl_hyperparams": dl_hyperparams,
-            "model_hyperparams": model_hyperparams,
-            "opt_hyperparams": opt_hyperparams,
-            "weight_initializer_hyperparams": weight_initializer_hyperparams,
-            "baseline": baseline,
-            **experiment,
-        }
-
-        ensemble = Ensemble(
-            train_data=train_data,
-            test_data=test_data,
-            **kwargs,
-            plot_fns=(
-                epsilon_scaling,
-                corr_scaling,
-                cos_sim_scaling,
-                loss_cf_scaling,
-                loss_true_scaling,
-            ),
-        )  # type: ignore
-
-        yield ensemble
-
-
-def gen_default_weight_initializer_hyperparams(n_perturbed=10, epsilon=0.01):
-    return [{**DEFAULT_WEIGHT_INITIALIZER_HYPERPARAMS, "epsilon": 0.0}] + [
-        {
-            **DEFAULT_WEIGHT_INITIALIZER_HYPERPARAMS,
-            "epsilon": epsilon,
-            "seed_perturbation": seed,
-        }
-        for seed in range(n_perturbed)
-    ]
-
-
-def gen_epsilon_range(n_samples: int = 10, epsilons=(0.001, 0.01, 0.1, 1.0)):
-    return [
-        {
-            **DEFAULT_WEIGHT_INITIALIZER_HYPERPARAMS,
-            "epsilon": 0,
-            "seed_perturbation": 0,
-            "seed_weights": 1,
-        }
-    ] + [
-        {
-            **DEFAULT_WEIGHT_INITIALIZER_HYPERPARAMS,
-            "epsilon": epsilon,
-            "seed_perturbation": seed,
-            "seed_weights": 1,
-        }
-        for epsilon in epsilons
-        for seed in range(n_samples)
-    ]
-
-
-experiments = [
-    {
-        # 0 Vanilla
-        "weight_initializer_hyperparams": gen_epsilon_range(10),
-        "dir": f"vanilla",
-    },
-    {
-        # 1 Depth
-        "weight_initializer_hyperparams": gen_default_weight_initializer_hyperparams(),
-        "model_hyperparams": [
-            {"n_hidden": n_hidden} for n_hidden in tuple((50,) * i for i in range(1, 6))
-        ],
-        "comparison": f"n_hidden",
-        "dir": f"depth",
-    },
-    {
-        # 2 Width
-        "weight_initializer_hyperparams": gen_default_weight_initializer_hyperparams(),
-        "model_hyperparams": [
-            {"n_hidden": n_hidden} for n_hidden in (400, 200, 100, 50, 25)
-        ],
-        "comparison": f"n_hidden",
-        "dir": f"width",
-    },
-    {
-        # 3 Momentum
-        "weight_initializer_hyperparams": gen_default_weight_initializer_hyperparams(),
-        "opt_hyperparams": [
-            {**DEFAULT_SGD_HYPERPARAMS, "momentum": momentum}
-            for momentum in (0.0, 0.1, 0.5, 0.9)
-        ],
-        "comparison": f"momentum",
-    },
-    {
-        # 4 Weight decay
-        "epsilon": (0.0, 0.01),
-        "weight_decay": (0.0, 0.001, 0.01, 0.1, 0.5, 0.9),
-        "comparison": "weight_decay",
-    },
-    {
-        # 5 Learning rate (TODO: compare over normalized time)
-        "weight_initializer_hyperparams": gen_default_weight_initializer_hyperparams(),
-        "opt_hyperparams": [
-            {**DEFAULT_SGD_HYPERPARAMS, "lr": lr} for lr in (0.1, 0.01, 0.001, 0.0001)
-        ],
-        "comparison": "lr",
-    },
-    {
-        # 6 Optimizer
-        "model_hyperparams": {
-            "cls": FCN,
-            "n_hidden": 100,
-        },
-        "opt_hyperparams": {
-            "cls": t.optim.Adam,
-            "lr": 0.001,
-            "betas": (0.9, 0.999),
-            "eps": 1e-08,
-            "weight_decay": 0,
-        },
-        "weight_initializer_hyperparams": gen_epsilon_range(),
-        "dir": "adam/2",
-    },
-    {
-        # 7 Convnets
-        "model_hyperparams": {
-            "cls": Lenet5,
-        },
-        "weight_initializer_hyperparams": gen_epsilon_range(),
-        "dir": f"lenet5/1",
-    },
-    {
-        # 8 Other datasets
-        "dataset": "cifar10",
-        "opt_hyperparams": {
-            "cls": t.optim.Adam,
-            "lr": 0.001,
-            "betas": (0.9, 0.999),
-            "eps": 1e-08,
-            "weight_decay": 0,
-        },
-        "model_hyperparams": {"cls": ResNet, "n_layers": 18},
-        "weight_initializer_hyperparams": gen_epsilon_range(5),
-        "dir": f"resnet/1",
-    },
-    {
-        # 0 More Vanilla
-        "weight_initializer_hyperparams": gen_epsilon_range(5, epsilons=(1.,)),
-        "opt_hyperparams": { 
-            **DEFAULT_SGD_HYPERPARAMS,
-            "lr": 0.1,
-        },
-        "dir": f"vanilla-long",
-    },
+from serimats.paths.checkpoints import Checkpointer
+from serimats.paths.interventions import Intervention
+from serimats.paths.metrics import Metrics
+from serimats.paths.models import ExtendedModule
+from serimats.paths.plots import Plotter
+from serimats.paths.trials import Trial
+from serimats.paths.utils import WithOptions, tqdm
+
+T = TypeVar("T")
+
+InterventionGroup = Union[
+    Intervention, Iterable[Intervention], Iterable[Iterable[Intervention]]
 ]
 
-if __name__ == "__main__":
-    experiments = [experiments[-1]]
 
-    for ensemble in tqdm(
-        make_ensembles(
-            experiments,
-            logging_ivl=1000,
-            plot_ivl=2000,
-            save_ivl=1000,
-        ),
-        desc="Running experiments...",
-        total=len(experiments),
+def _fix_intervention_group(
+    intervention_group: InterventionGroup,
+) -> List[List[Intervention]]:
+    if isinstance(intervention_group, Intervention):
+        return [[intervention_group]]
+
+    elif isinstance(intervention_group, Iterable):
+        intervention_group = list(intervention_group)
+
+        if isinstance(intervention_group[0], Intervention):
+            return [intervention_group]
+
+        return [list(i) for i in intervention_group]
+
+    raise TypeError(
+        "intervention_group must be an Intervention, Iterable[Intervention], or Iterable[Iterable[Intervention]]"
+    )
+
+
+class Experiment:
+    def __init__(
+        self,
+        model: WithOptions[Type[ExtendedModule]],
+        datasets: Union[Tuple[Dataset, ...], Dict[str, Dataset]],
+        interventions: InterventionGroup,
+        opt: WithOptions[Type[optim.Optimizer]] = optim.SGD,
+        dl: WithOptions[Type[DataLoader]] = DataLoader,
+        variations: Optional[InterventionGroup] = None,
+        plotter: Optional[Plotter] = None,
+        checkpointer: Optional[Checkpointer] = None,
+        metrics: Optional[Metrics] = None,
     ):
-        ensemble.train(n_epochs=200)
+        # Datasets
 
-# %%
+        if isinstance(datasets, tuple):
+            if len(datasets) != 2:
+                raise ValueError("datasets must be a tuple of length 2")
+
+            datasets = {"train": datasets[0], "test": datasets[1]}
+
+        # Data loaders
+
+        dl_kwargs = {"batch_size": 64, "shuffle": True}
+
+        if isinstance(dl, tuple):
+            dl, dl_kwargs = dl
+
+        dls: Dict[str, DataLoader] = {}
+
+        for name, dataset in datasets.items():
+            dls[name] = dl(dataset, **dl_kwargs)
+
+        self.dls = dls
+        train_loader = dls["train"]
+
+        # Metrics
+
+        self.metrics = metrics or Metrics()
+        self.metrics.add_dls(dls)
+
+        # Plotter
+
+        self.plotter = plotter
+
+        if self.plotter is not None:
+            self.plotter.register(self)
+            self.plotter.add_metrics(self.metrics)
+
+        # Checkpointer
+
+        self.checkpointer = checkpointer or Checkpointer()
+
+        # Controls
+
+        self.trials = []
+
+        if variations is None:
+            self.variations = []
+            self.trials.append(Trial(model, opt, train_loader))
+        else:
+            self.variations = _fix_intervention_group(variations)
+
+            for variation_combo in itertools.product(*self.variations):
+                self.trials.append(Trial(model, opt, train_loader, variation_combo))  # type: ignore
+
+        # Interventions
+
+        self.interventions = _fix_intervention_group(interventions)
+
+        for trial in self.trials:
+            for intervention_combo in itertools.product(*self.interventions):
+                self.trials.append(trial.with_interventions(intervention_combo))
+
+    def run(self, n_epochs: int, reset: bool = False):
+        epoch_idx, batch_idx, step = 0, 0, 0
+        epoch_len = len(self.dls["train"]) / self.dls["train"].batch_size  # type: ignore
+
+        for trial in tqdm(self.trials, desc="Trials"):
+            trial = self.checkpointer.load(trial)
+
+            for epoch_idx, epoch in tqdm(
+                trial.run(n_epochs, reset=reset), desc="Epochs", total=n_epochs
+            ):
+                for batch_idx, step, _, loss in tqdm(
+                    epoch, desc=f"Epoch {epoch_idx}", total=epoch_len
+                ):
+                    if step % self.metrics.ivl == 0:
+                        self.metrics.measure(
+                            epoch_idx=epoch_idx,
+                            batch_idx=batch_idx,
+                            step=step,
+                            trial=trial,
+                        )
+
+                    if step % self.checkpointer.ivl == 0:
+                        self.checkpointer.save(
+                            epoch_idx=epoch_idx,
+                            batch_idx=batch_idx,
+                            step=step,
+                            trial=trial,
+                        )
+
+        if self.plotter:
+            self.plotter.plot(
+                epoch_idx=epoch_idx,
+                batch_idx=batch_idx,
+                step=step,
+            )
+
+    def df(self):
+        """Returns a dataframe with the logs of all trials"""
+        return pd.concat([trial.df() for trial in self.trials])
+
+    def __getitem__(self, i):
+        return self.trials[i]
+
+    def __len__(self):
+        return len(self.trials)
