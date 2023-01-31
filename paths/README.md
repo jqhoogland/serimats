@@ -39,7 +39,7 @@ exp = Experiment(
     interventions=[
         PerturbWeights.make_variations(
             epsilon=(0.001, 0.01, 0.1),  
-            seed=range(10)
+            seed_weights=range(10)
         )
     ]
 )
@@ -52,22 +52,22 @@ exp.run(n_epochs=10)
 Or maybe I want to compare the behavior of different optimizers.
 
 ```python
-from serimats.interventions import InitWeightsIntervention, OptimizerIntervention
+from serimats.interventions import ReinitWeights, ChangeOptimizer
 
 exp = Experiment(
     model=Lenet5(),
     dataset=(train_set, test_set),
     variations=[
-        InitWeightsIntervention.make_variations(
-            seed=range(5)
+        ReinitWeights.make_variations(
+            seed_weights=range(5)
         ),
-        OptimizerIntervention.make_variations(
+        ChangeOptimizer.make_variations(
             optimizer=torch.optim.SGD,
             lr=(0.001, 0.01, 0.1),
         )
     ],
     interventions=[
-        OptimizerIntervention.make_variations(
+        ChangeOptimizer.make_variations(
             optimizer=torch.optim.Adam,
         )
     ],
@@ -85,16 +85,16 @@ exp = Experiment(
     model=Lenet5(),
     dataset=(train_set, test_set),
     variations=[
-        InitWeightsIntervention.make_variations(
-            seed=range(5)
+        ReinitWeights.make_variations(
+            seed_weights=range(5)
         ),
-        TrainLoaderIntervention.make_variations(
+        ChangeTrainLoader.make_variations(
             batch_size=32,
-            batch_order_seed=(.1, .2, .3)
+            seed_shuffle=(.1, .2, .3)
         )
     ],
     interventions=[
-        TrainLoaderIntervention.make_variations(
+        ChangeTrainLoader.make_variations(
             batch_size=(64, 128, 256, 512, 1024),
         )
     ]
@@ -111,15 +111,15 @@ exp = Experiment(
     model=Lenet5(),
     dataset=(train_set, test_set),
     variations=[
-        InitWeightsIntervention.make_variations(
-            seed=range(10)
+        ReinitWeights.make_variations(
+            seed_weights=range(10)
         ),
-        OptimizerIntervention.make_variations(
+        ChangeOptimizer.make_variations(
             momentum=(0.9, 0.99, 0.999),
         ),
     ],
     interventions=[
-        PerturbMomentumIntervention.make_variations(
+        ChangeOptimizer.make_variations(
             momentum=lambda m: (m * (1 + epsilon) for epsilon in (0.001, -0.001, 0.01, -0.01, 0.1, -0.1)),
             when=((0, 100), (1000, 1100), (5000, 5100)),  # Step ranges to maintain perturbation
         )
@@ -132,7 +132,7 @@ exp = Experiment(
 
 That's a *lot* of trials. My computer will take several days to run all of them.
 
-So I can get rid of the `InitWeightsIntervention`, which leaves me with a more reasonable 21 trials. 
+So I can get rid of the `ReinitWeights`, which leaves me with a more reasonable 21 trials. 
 After I've validated for a fixed choice of weight initialization, I can add it back in, and run the experiment again. Best of all, it'll automatically skip the trials that have already been run.
 
 Alternatively, I can train for only a few epochs, validate the results, and then train for more epochs, picking up where I left off from the checkpoints.
@@ -181,23 +181,22 @@ exp = Experiment(
     model=Lenet5(),
     dataset=(train_set, test_set),
     variations=[
-        InitWeightsIntervention.make_variations(
-            seed=range(5)
+        ReinitWeights.make_variations(
+            seed_weights=range(5)
         ),
-        TrainLoaderIntervention.make_variations(
+        ChangeTrainLoader.make_variations(
             batch_size=32,
-            batch_order_seed=(.1, .2, .3)
+            batch_order_seed_weights=(.1, .2, .3)
         )
     ],
     interventions=[
-        TrainLoaderIntervention.make_variations(
+        ChangeTrainLoader.make_variations(
             batch_size=(64, 128, 256, 512, 1024),
         )
     ],
     metrics=CustomMetrics(),
     plotter=Plotter(
-        average_over=('batch_order_seed', 'seed'), # Note: the order matters! TODO: Wait does it actually?
-        metrics=('loss', 'accuracy', 'weight_norm', 'weight_distance_from_control')
+        average_over=('seed_shuffle', 'seed'), # Note: the order matters! TODO: Wait does it actually?
     )
 )
 

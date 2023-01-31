@@ -3,8 +3,8 @@ from pathlib import Path
 from typing import Optional, Union
 
 import pandas as pd
+import torch as t
 import yaml
-from torch import t
 
 from serimats.paths.trials import Trial
 
@@ -12,7 +12,7 @@ Pathy = Union[Path, str]
 
 
 class Checkpointer:
-    def __init__(self, ivl=1000, dir: Pathy = Path("checkpoints")) -> None:
+    def __init__(self, ivl=1_000, dir: Pathy = Path("checkpoints")) -> None:
         self.ivl = ivl
         self.dir = Path(dir)
 
@@ -30,7 +30,7 @@ class Checkpointer:
         trial: Trial,
         overwrite: bool = False,
     ):
-        path = self.path_to_step(trial.unique_name(), step)
+        path = self.path_to_step(trial.unique_name, step)
 
         path.mkdir(parents=True, exist_ok=True)
 
@@ -42,6 +42,8 @@ class Checkpointer:
         trial.df(full=False).to_csv(path / "../logs.csv")
         yaml.dump(trial.hyperparams, open(path / "../hyperparams.yaml", "w"))
 
+        assert trial.model is not None and trial.opt is not None, "Trial not active"
+
         t.save(trial.model.state_dict(), path / "model.pt")
         t.save(trial.opt.state_dict(), path / "opt.pt")
 
@@ -50,21 +52,21 @@ class Checkpointer:
         return True
 
     def load(self, trial: Trial, step: Optional[int] = None) -> Trial:
-        path = self.path(trial.unique_name())
+        path = self.path(trial.unique_name)
 
         try:
-            logs_df = pd.read_csv(path / "../logs.csv")
+            logs_df = pd.read_csv(path / "logs.csv")
 
             if step is None:
-                self.step = logs_df["step"].max().item()
-            else:
-                self.step = step
+                step = logs_df["step"].max().item()
 
             logs_df = logs_df.set_index("step")
-            trial.logs = logs_df.to_dict(orient="index")
+            trial.logs.update(logs_df.to_dict(orient="index"))
+            
+            logging.info(f"Loaded logs from {path / 'logs.csv'}")
 
         except FileNotFoundError:
-            logging.info(f"Could not load logs from {trial.path / 'logs.csv'}")
+            logging.info(f"Could not load logs from {path / 'logs.csv'}")
             logging.info(yaml.dump(trial.hyperparams))
             trial.logs = {}
 
@@ -73,7 +75,8 @@ class Checkpointer:
         if not isinstance(step, int):
             raise ValueError(f"step must be an int, got {step} ({type(step)})")
 
-        path_to_step = self.path_to_step(trial.unique_name(), step)
+        path_to_step = self.path_to_step(trial.unique_name, step)
+        trial.step = step
 
         try:
             if not trial.active:    

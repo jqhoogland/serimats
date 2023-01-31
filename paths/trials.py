@@ -1,111 +1,73 @@
-import itertools
-import logging
-import os
-from dataclasses import dataclass, field
-from os import PathLike
-from pathlib import Path
-from pprint import pp
-from typing import (
-    Any,
-    Callable,
-    Dict,
-    Generator,
-    Generic,
-    Iterable,
-    List,
-    Literal,
-    Optional,
-    Tuple,
-    Type,
-    TypedDict,
-    TypeVar,
-    Union,
-)
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Type
 
-import numpy as np
 import pandas as pd
 import torch as t
-import yaml
-from matplotlib import pyplot as plt
-from matplotlib.figure import Figure
-from pyrsistent import T
-from torch import nn, optim
+from torch import optim
 from torch.nn import functional as F
 from torch.utils.data import DataLoader, Dataset
-from torchvision import datasets, transforms
 
-from serimats.paths.interventions import Intervention
-from serimats.paths.models import FCN, ExtendedModule, Lenet5, ResNet
-from serimats.paths.plots import plot_metric_scaling
-from serimats.paths.utils import (
-    CallableWithLatex,
-    OptionalTuple,
-    WithOptions,
-    dict_to_latex,
-    setup,
-    stable_hash,
-    to_tuple,
-    tqdm,
-    trange,
-    var_to_latex,
-)
-from serimats.paths.weights import (
-    AbsolutePerturbationInitializer,
-    RelativePerturbationInitializer,
-    WeightInitializer,
-)
+from serimats.paths.types_ import WithOptions
+from serimats.paths.utils import stable_hash, to_tuple
 
-
-def get_opt_hyperparams(opt: optim.Optimizer) -> dict:
-    """Assumes that the optimizer has only a single set of hyperparams
-    (and not a separate set for each parameter group)"""
-    param_group = opt.param_groups[0]
-
-    hyperparams = {}
-
-    for k, v in param_group.items():
-        if k not in ["params", "foreach", "maximize", "capturable", "fused"]:
-            hyperparams[k] = v
-
-    return hyperparams
+if TYPE_CHECKING:
+    from serimats.paths.interventions.base import Intervention
+    from serimats.paths.variables.dataloaders import ExtendedDataLoader
+    from serimats.paths.variables.module import ExtendedModule
+    from serimats.paths.variables.optim import ExtendedOptimizer
 
 
 class Trial:
-    control: Optional["Trial"] = None
-    model: Optional[ExtendedModule] = None
-    opt: Optional[optim.Optimizer] = None
+    model_hyperparams: Dict[str, Any]
+    opt_hyperparams: Dict[str, Any]
 
     def __init__(
         self,
-        model: WithOptions[Type[ExtendedModule]],
-        opt: WithOptions[Type[optim.Optimizer]],
-        train_loader: DataLoader,
-        variations: Optional[List[List[Intervention]]] = None,
+        model: WithOptions[Type["ExtendedModule"]],
+        opt: WithOptions[Type["ExtendedOptimizer"]],
+        dl: Tuple[Type["ExtendedDataLoader"], Dict[str, Any], Dataset],
+        interventions: Optional[List["Intervention"]] = None,
+        control: Optional["Trial"] = None,
     ):
+        # TODO: What if model_hyperparams or opt_hyperparams are missing defaults?
         self.model_cls, self.model_hyperparams = to_tuple(model, {})
         self.model = None
+
+        self.control: Optional["Trial"] = control
 
         self.opt_cls, self.opt_hyperparams = to_tuple(opt, {})
         self.opt = None
 
-        self.train_loader = train_loader
-        self.variations = variations or []
+        self.dl_cls, self.dl_hyperparams, self.dataset = dl
+        self.dl = None
+
+        self.interventions = interventions or []
 
         self.logs = {}
-        self.step = 0
         self.active = False
+
+        self.step = 0
 
     def activate(self):
         self.active = True
 
         self.model = self.model or self.model_cls(**self.model_hyperparams)  # type: ignore
         self.opt = self.opt or self.opt_cls(self.model.parameters(), **self.opt_hyperparams)  # type: ignore
+        self.dl = self.dl or self.dl_cls(self.dataset, **self.dl_hyperparams)  # type: ignore
+
+        if self.control is not None:
+            self.control.activate()
 
     def deactivate(self):
+        """
+        Deactivate the trial to free up memory.
+        """
         self.active = False
 
         self.model = None
         self.opt = None
+
+        if self.control is not None:
+            self.control.deactivate()
 
     def __enter__(self):
         self.activate()
@@ -119,19 +81,27 @@ class Trial:
     ) -> t.Tensor:
         return F.nll_loss(output, target, reduction=reduction)
 
-    def run(self, n_epochs: int = 1, **kwargs):
+    def run(self, n_epochs: int = 1, start: int = 0, **kwargs):
         with self:
-            for epoch_idx in range(n_epochs):
+            for epoch_idx in range(start, n_epochs):
                 yield epoch_idx, self.run_epoch(epoch_idx, **kwargs)
 
     def run_epoch(self, epoch_idx: int, reset: bool = False, **kwargs):
-        for batch_idx, batch in enumerate(self.train_loader):
-            step = epoch_idx * len(self.train_loader) + batch_idx
+        self.dl.step = epoch_idx * len(self.dl)  # To ensure consistent seeds for each epoch
 
-            if step < self.step and not reset:
+        if self.dl.step < self.step and not reset:
+            return
+
+        for batch_idx, batch in enumerate(self.dl):
+            if self.dl.step < self.step and not reset:
                 continue
 
-            yield batch_idx, step, batch, self.run_batch(batch, **kwargs)
+            # Seems a bit wasteful, but it's only a constant factor (relative to the training time)
+            for intervention in self.interventions:
+                intervention.toggle_if_needed(self)
+
+            yield batch_idx, self.dl.step, batch, self.run_batch(batch, **kwargs)
+
 
     def run_batch(self, batch: Tuple[t.Tensor, t.Tensor]):
         # assert self.active and self.model is not None and self.opt is not None, "Trial not active"
@@ -156,19 +126,31 @@ class Trial:
         self.logs[step].update(kwargs)
 
     @property
-    def name(self):
-        return f"{self.model.__class__.__name__}_{self.hash}"
+    def unique_name(self):
+        return f"{self.model_cls.__name__}_{self.hash}"
 
     @property
     def hash(self):
         return stable_hash(self.extra_repr)
 
     @property
-    def hyperparams(self):
+    def intervention_hyperparams(self):
         hyperparams = {
-            **self.model.hyperparams,
-            **get_opt_hyperparams(self.opt),
-            **self.weight_initializer.hyperparams,
+            k: v
+            for intervention in self.interventions
+            for k, v in intervention.hyperparams.items()
+        }
+
+        return {k: hyperparams[k] for k in sorted(hyperparams.keys())}
+
+    @property
+    def hyperparams(self):
+
+        hyperparams = {
+            **self.model_hyperparams,
+            **self.opt_hyperparams,
+            **self.dl_hyperparams,
+            **self.intervention_hyperparams,
         }
 
         # Consistent ordering
@@ -200,6 +182,7 @@ class Trial:
         return self.model.device
 
     def __call__(self, *args, **kwargs) -> t.Tensor:
+        assert self.active and self.model is not None, "Trial not active"
         return self.model(*args, **kwargs)
 
     def __getattribute__(self, __name: str) -> Any:
@@ -207,4 +190,21 @@ class Trial:
         try:
             return super().__getattribute__(__name)
         except AttributeError:
-            return getattr(self.model, __name)
+            if self.model is not None:
+                return getattr(self.model, __name)
+
+    def with_interventions(self, interventions: List["Intervention"]):
+        return self.__class__(
+            model=(self.model_cls, self.model_hyperparams),
+            opt=(self.opt_cls, self.opt_hyperparams),
+            dl=(self.dl_cls, self.dl_hyperparams, self.dataset),
+            interventions=[*self.interventions, *interventions],
+            control=self,
+        )
+
+    @property
+    def init(self):
+        return self.model.weight_initializer
+    
+    def __repr__(self) -> str:
+        return f"{self.unique_name}({self.extra_repr})"
